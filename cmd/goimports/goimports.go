@@ -56,9 +56,10 @@ var (
 func init() {
 	flag.BoolVar(&options.AllErrors, "e", false, "report all errors (not just the first 10 on different lines)")
 	flag.StringVar(&options.Env.LocalPrefix, "local", "", "put imports beginning with this string after 3rd-party packages; comma-separated list")
+	// add my company domain
+	options.Env.LocalPrefix = "git.intra.weibo.com"
 	flag.BoolVar(&options.FormatOnly, "format-only", false, "if true, don't fix imports and only format. In this mode, goimports is effectively gofmt, with the addition that imports are grouped into sections.")
 }
-
 func report(err error) {
 	scanner.PrintError(os.Stderr, err)
 	exitCode = 2
