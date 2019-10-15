@@ -14,15 +14,18 @@ import (
 	"golang.org/x/tools/internal/telemetry/trace"
 )
 
-func DocumentSymbols(ctx context.Context, view View, f GoFile) ([]protocol.DocumentSymbol, error) {
+func DocumentSymbols(ctx context.Context, view View, f File) ([]protocol.DocumentSymbol, error) {
 	ctx, done := trace.StartSpan(ctx, "source.DocumentSymbols")
 	defer done()
 
-	cphs, err := f.CheckPackageHandles(ctx)
+	_, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return nil, err
 	}
-	cph := NarrowestCheckPackageHandle(cphs)
+	cph, err := NarrowestCheckPackageHandle(cphs)
+	if err != nil {
+		return nil, err
+	}
 	pkg, err := cph.Check(ctx)
 	if err != nil {
 		return nil, err

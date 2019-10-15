@@ -17,7 +17,6 @@ import (
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/telemetry/log"
 	"golang.org/x/tools/internal/telemetry/trace"
-	errors "golang.org/x/xerrors"
 )
 
 type Diagnostic struct {
@@ -25,7 +24,7 @@ type Diagnostic struct {
 	Range    protocol.Range
 	Message  string
 	Source   string
-	Severity DiagnosticSeverity
+	Severity protocol.DiagnosticSeverity
 	Tags     []protocol.DiagnosticTag
 
 	SuggestedFixes []SuggestedFix
@@ -38,15 +37,28 @@ const (
 	SeverityError
 )
 
-func Diagnostics(ctx context.Context, view View, f GoFile, disabledAnalyses map[string]struct{}) (map[span.URI][]Diagnostic, string, error) {
+func Diagnostics(ctx context.Context, view View, f File, disabledAnalyses map[string]struct{}) (map[span.URI][]Diagnostic, string, error) {
 	ctx, done := trace.StartSpan(ctx, "source.Diagnostics", telemetry.File.Of(f.URI()))
 	defer done()
 
-	cphs, err := f.CheckPackageHandles(ctx)
+	snapshot, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return nil, "", err
 	}
-	cph := WidestCheckPackageHandle(cphs)
+	cph, err := WidestCheckPackageHandle(cphs)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// If we are missing dependencies, it may because the user's workspace is
+	// not correctly configured. Report errors, if possible.
+	var warningMsg string
+	if len(cph.MissingDependencies()) > 0 {
+		warningMsg, err = checkCommonErrors(ctx, view, f.URI())
+		if err != nil {
+			log.Error(ctx, "error checking common errors", err, telemetry.File.Of(f.URI))
+		}
+	}
 	pkg, err := cph.Check(ctx)
 	if err != nil {
 		log.Error(ctx, "no package for file", err)
@@ -57,15 +69,6 @@ func Diagnostics(ctx context.Context, view View, f GoFile, disabledAnalyses map[
 	reports := make(map[span.URI][]Diagnostic)
 	for _, fh := range pkg.Files() {
 		clearReports(view, reports, fh.File().Identity().URI)
-	}
-
-	// If we have `go list` errors, we may want to offer a warning message to the user.
-	var warningMsg string
-	if hasListErrors(pkg.GetErrors()) {
-		warningMsg, err = checkCommonErrors(ctx, view, f.URI())
-		if err != nil {
-			log.Error(ctx, "error checking common errors", err, telemetry.File.Of(f.URI))
-		}
 	}
 
 	// Prepare any additional reports for the errors in this package.
@@ -79,12 +82,12 @@ func Diagnostics(ctx context.Context, view View, f GoFile, disabledAnalyses map[
 	// Run diagnostics for the package that this URI belongs to.
 	if !diagnostics(ctx, view, pkg, reports) {
 		// If we don't have any list, parse, or type errors, run analyses.
-		if err := analyses(ctx, view, cph, disabledAnalyses, reports); err != nil {
+		if err := analyses(ctx, snapshot, cph, disabledAnalyses, reports); err != nil {
 			log.Error(ctx, "failed to run analyses", err, telemetry.File.Of(f.URI()))
 		}
 	}
 	// Updates to the diagnostics for this package may need to be propagated.
-	revDeps := view.GetActiveReverseDeps(ctx, f.URI())
+	revDeps := view.GetActiveReverseDeps(ctx, f)
 	for _, cph := range revDeps {
 		pkg, err := cph.Check(ctx)
 		if err != nil {
@@ -113,7 +116,7 @@ func diagnostics(ctx context.Context, view View, pkg Package, reports map[span.U
 			URI:      spn.URI(),
 			Message:  err.Msg,
 			Source:   "LSP",
-			Severity: SeverityError,
+			Severity: protocol.SeverityError,
 		}
 		set, ok := diagSets[diag.URI]
 		if !ok {
@@ -185,14 +188,16 @@ func spanToRange(ctx context.Context, view View, pkg Package, spn span.Span, isT
 	return m.Range(spn)
 }
 
-func analyses(ctx context.Context, view View, cph CheckPackageHandle, disabledAnalyses map[string]struct{}, reports map[span.URI][]Diagnostic) error {
+func analyses(ctx context.Context, snapshot Snapshot, cph CheckPackageHandle, disabledAnalyses map[string]struct{}, reports map[span.URI][]Diagnostic) error {
 	// Type checking and parsing succeeded. Run analyses.
-	if err := runAnalyses(ctx, view, cph, disabledAnalyses, func(a *analysis.Analyzer, diag analysis.Diagnostic) error {
-		diagnostic, err := toDiagnostic(ctx, view, diag, a.Name)
-		if err != nil {
-			return err
+	if err := runAnalyses(ctx, snapshot, cph, disabledAnalyses, func(diags []*analysis.Diagnostic, a *analysis.Analyzer) error {
+		for _, diag := range diags {
+			diagnostic, err := toDiagnostic(ctx, snapshot.View(), diag, a.Name)
+			if err != nil {
+				return err
+			}
+			addReport(snapshot.View(), reports, diagnostic.URI, diagnostic)
 		}
-		addReport(view, reports, diagnostic.URI, diagnostic)
 		return nil
 	}); err != nil {
 		return err
@@ -200,31 +205,27 @@ func analyses(ctx context.Context, view View, cph CheckPackageHandle, disabledAn
 	return nil
 }
 
-func toDiagnostic(ctx context.Context, view View, diag analysis.Diagnostic, category string) (Diagnostic, error) {
+func toDiagnostic(ctx context.Context, view View, diag *analysis.Diagnostic, category string) (Diagnostic, error) {
 	r := span.NewRange(view.Session().Cache().FileSet(), diag.Pos, diag.End)
 	spn, err := r.Span()
 	if err != nil {
 		// The diagnostic has an invalid position, so we don't have a valid span.
 		return Diagnostic{}, err
 	}
-	if diag.Category != "" {
-		category += "." + category
-	}
 	f, err := view.GetFile(ctx, spn.URI())
 	if err != nil {
 		return Diagnostic{}, err
 	}
-	gof, ok := f.(GoFile)
-	if !ok {
-		return Diagnostic{}, errors.Errorf("%s is not a Go file", f.URI())
-	}
 	// If the package has changed since these diagnostics were computed,
 	// this may be incorrect. Should the package be associated with the diagnostic?
-	cphs, err := gof.CheckPackageHandles(ctx)
+	_, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return Diagnostic{}, err
 	}
-	cph := NarrowestCheckPackageHandle(cphs)
+	cph, err := NarrowestCheckPackageHandle(cphs)
+	if err != nil {
+		return Diagnostic{}, err
+	}
 	pkg, err := cph.Cached(ctx)
 	if err != nil {
 		return Diagnostic{}, err
@@ -244,12 +245,15 @@ func toDiagnostic(ctx context.Context, view View, diag analysis.Diagnostic, cate
 	if onlyDeletions(fixes) {
 		tags = append(tags, protocol.Unnecessary)
 	}
+	if diag.Category != "" {
+		category += "." + diag.Category
+	}
 	return Diagnostic{
 		URI:            spn.URI(),
 		Range:          rng,
 		Source:         category,
 		Message:        diag.Message,
-		Severity:       SeverityWarning,
+		Severity:       protocol.SeverityWarning,
 		SuggestedFixes: fixes,
 		Tags:           tags,
 	}, nil
@@ -302,38 +306,33 @@ func singleDiagnostic(uri span.URI, format string, a ...interface{}) map[span.UR
 			URI:      uri,
 			Range:    protocol.Range{},
 			Message:  fmt.Sprintf(format, a...),
-			Severity: SeverityError,
+			Severity: protocol.SeverityError,
 		}},
 	}
 }
 
-func runAnalyses(ctx context.Context, view View, cph CheckPackageHandle, disabledAnalyses map[string]struct{}, report func(a *analysis.Analyzer, diag analysis.Diagnostic) error) error {
+func runAnalyses(ctx context.Context, snapshot Snapshot, cph CheckPackageHandle, disabledAnalyses map[string]struct{}, report func(diag []*analysis.Diagnostic, a *analysis.Analyzer) error) error {
 	var analyzers []*analysis.Analyzer
-	for _, a := range view.Analyzers() {
+	for _, a := range snapshot.View().Options().Analyzers {
 		if _, ok := disabledAnalyses[a.Name]; ok {
 			continue
 		}
 		analyzers = append(analyzers, a)
 	}
 
-	roots, err := analyze(ctx, view, []CheckPackageHandle{cph}, analyzers)
+	diagnostics, err := snapshot.Analyze(ctx, cph.ID(), analyzers)
 	if err != nil {
 		return err
 	}
 
 	// Report diagnostics and errors from root analyzers.
-	for _, r := range roots {
-		var sdiags []Diagnostic
-		for _, diag := range r.diagnostics {
-			if r.err != nil {
-				// TODO(matloob): This isn't quite right: we might return a failed prerequisites error,
-				// which isn't super useful...
-				return r.err
-			}
-			if err := report(r.Analyzer, diag); err != nil {
-				return err
-			}
-			sdiag, err := toDiagnostic(ctx, view, diag, r.Analyzer.Name)
+	var sdiags []Diagnostic
+	for a, diags := range diagnostics {
+		if err := report(diags, a); err != nil {
+			return err
+		}
+		for _, diag := range diags {
+			sdiag, err := toDiagnostic(ctx, snapshot.View(), diag, a.Name)
 			if err != nil {
 				return err
 			}
@@ -343,7 +342,7 @@ func runAnalyses(ctx context.Context, view View, cph CheckPackageHandle, disable
 		if err != nil {
 			return err
 		}
-		pkg.SetDiagnostics(r.Analyzer, sdiags)
+		pkg.SetDiagnostics(a, sdiags)
 	}
 	return nil
 }

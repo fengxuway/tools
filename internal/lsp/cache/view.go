@@ -15,13 +15,13 @@ import (
 	"strings"
 	"sync"
 
-	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/imports"
 	"golang.org/x/tools/internal/lsp/debug"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/telemetry/log"
+	"golang.org/x/tools/internal/xcontext"
 	errors "golang.org/x/xerrors"
 )
 
@@ -79,8 +79,6 @@ type view struct {
 	// ignoredURIs is the set of URIs of files that we ignore.
 	ignoredURIsMu sync.Mutex
 	ignoredURIs   map[span.URI]struct{}
-
-	analyzers []*analysis.Analyzer
 }
 
 func (v *view) Session() source.Session {
@@ -111,6 +109,7 @@ func (v *view) Config(ctx context.Context) *packages.Config {
 	// TODO: Should we cache the config and/or overlay somewhere?
 	return &packages.Config{
 		Dir:        v.folder.Filename(),
+		Context:    ctx,
 		Env:        v.options.Env,
 		BuildFlags: v.options.BuildFlags,
 		Mode: packages.NeedName |
@@ -288,6 +287,17 @@ func (v *view) BuiltinPackage() source.BuiltinPackage {
 	return v.builtin
 }
 
+func (v *view) Snapshot() source.Snapshot {
+	return v.getSnapshot()
+}
+
+func (v *view) getSnapshot() *snapshot {
+	v.snapshotMu.Lock()
+	defer v.snapshotMu.Unlock()
+
+	return v.snapshot
+}
+
 // SetContent sets the overlay contents for a file.
 func (v *view) SetContent(ctx context.Context, uri span.URI, content []byte) (bool, error) {
 	v.mu.Lock()
@@ -298,11 +308,12 @@ func (v *view) SetContent(ctx context.Context, uri span.URI, content []byte) (bo
 	v.cancel()
 	v.backgroundCtx, v.cancel = context.WithCancel(v.baseCtx)
 
-	if !v.Ignore(uri) {
-		kind := source.DetectLanguage("", uri.Filename())
-		return v.session.SetOverlay(uri, kind, content), nil
+	if v.Ignore(uri) {
+		return false, nil
 	}
-	return false, nil
+
+	kind := source.DetectLanguage("", uri.Filename())
+	return v.session.SetOverlay(uri, kind, content), nil
 }
 
 // FindFile returns the file if the given URI is already a part of the view.
@@ -329,46 +340,21 @@ func (v *view) GetFile(ctx context.Context, uri span.URI) (source.File, error) {
 
 // getFile is the unlocked internal implementation of GetFile.
 func (v *view) getFile(ctx context.Context, uri span.URI, kind source.FileKind) (viewFile, error) {
-	if f, err := v.findFile(uri); err != nil {
+	f, err := v.findFile(uri)
+	if err != nil {
 		return nil, err
 	} else if f != nil {
 		return f, nil
 	}
-	var f viewFile
-	switch kind {
-	case source.Mod:
-		f = &modFile{
-			fileBase: fileBase{
-				view:  v,
-				fname: uri.Filename(),
-				kind:  source.Mod,
-			},
-		}
-	case source.Sum:
-		f = &sumFile{
-			fileBase: fileBase{
-				view:  v,
-				fname: uri.Filename(),
-				kind:  source.Sum,
-			},
-		}
-	default:
-		// Assume that all other files are Go files, regardless of extension.
-		f = &goFile{
-			fileBase: fileBase{
-				view:  v,
-				fname: uri.Filename(),
-				kind:  source.Go,
-			},
-		}
-		v.session.filesWatchMap.Watch(uri, func() {
-			gof, ok := f.(*goFile)
-			if !ok {
-				return
-			}
-			v.invalidateContent(ctx, gof)
-		})
+	f = &fileBase{
+		view:  v,
+		fname: uri.Filename(),
+		kind:  source.Go,
 	}
+	v.session.filesWatchMap.Watch(uri, func() {
+		ctx := xcontext.Detach(ctx)
+		v.invalidateContent(ctx, uri, kind)
+	})
 	v.mapFile(uri, f)
 	return f, nil
 }
@@ -408,10 +394,6 @@ func (v *view) findFile(uri span.URI) (viewFile, error) {
 	return nil, nil
 }
 
-func (v *view) Analyzers() []*analysis.Analyzer {
-	return v.analyzers
-}
-
 func (f *fileBase) addURI(uri span.URI) int {
 	f.uris = append(f.uris, uri)
 	return len(f.uris)
@@ -425,11 +407,11 @@ func (v *view) mapFile(uri span.URI, f viewFile) {
 	}
 }
 
-func (v *view) openFiles(ctx context.Context, uris map[span.URI]struct{}) (results []source.File) {
+func (v *view) openFiles(ctx context.Context, uris []span.URI) (results []source.File) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	for uri := range uris {
+	for _, uri := range uris {
 		// Call unlocked version of getFile since we hold the lock on the view.
 		if f, err := v.getFile(ctx, uri, source.Go); err == nil && v.session.IsOpen(uri) {
 			results = append(results, f)

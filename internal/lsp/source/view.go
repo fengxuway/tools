@@ -60,15 +60,6 @@ const (
 	UnknownKind
 )
 
-// TokenHandle represents a handle to the *token.File for a file.
-type TokenHandle interface {
-	// File returns a file handle for which to get the *token.File.
-	File() FileHandle
-
-	// Token returns the *token.File for the file.
-	Token(ctx context.Context) (*token.File, error)
-}
-
 // ParseGoHandle represents a handle to the AST for a file.
 type ParseGoHandle interface {
 	// File returns a file handle for which to get the AST.
@@ -114,14 +105,14 @@ type CheckPackageHandle interface {
 	// ParseGoHandle returns a ParseGoHandle for which to get the package.
 	Files() []ParseGoHandle
 
-	// Config is the *packages.Config that the package metadata was loaded with.
-	Config() *packages.Config
-
 	// Check returns the type-checked Package for the CheckPackageHandle.
 	Check(ctx context.Context) (Package, error)
 
 	// Cached returns the Package for the CheckPackageHandle if it has already been stored.
 	Cached(ctx context.Context) (Package, error)
+
+	// MissingDependencies reports any unresolved imports.
+	MissingDependencies() []string
 }
 
 // Cache abstracts the core logic of dealing with the environment from the
@@ -140,9 +131,6 @@ type Cache interface {
 
 	// FileSet returns the shared fileset used by all files in the system.
 	FileSet() *token.FileSet
-
-	// TokenHandle returns a TokenHandle for the given file handle.
-	TokenHandle(fh FileHandle) TokenHandle
 
 	// ParseGoHandle returns a ParseGoHandle for the given file handle.
 	ParseGoHandle(fh FileHandle, mode ParseMode) ParseGoHandle
@@ -238,6 +226,7 @@ type View interface {
 	// Ignore returns true if this file should be ignored by this view.
 	Ignore(span.URI) bool
 
+	// Config returns the configuration for the view.
 	Config(ctx context.Context) *packages.Config
 
 	// RunProcessEnvFunc runs fn with the process env for this view inserted into opts.
@@ -252,36 +241,34 @@ type View interface {
 	// This function does not correctly invalidate the view when needed.
 	SetOptions(Options)
 
-	// Analyzers returns the set of Analyzers active for this view.
-	Analyzers() []*analysis.Analyzer
+	// CheckPackageHandles returns the CheckPackageHandles for the packages
+	// that this file belongs to.
+	CheckPackageHandles(ctx context.Context, f File) (Snapshot, []CheckPackageHandle, error)
 
 	// GetActiveReverseDeps returns the active files belonging to the reverse
 	// dependencies of this file's package.
-	GetActiveReverseDeps(ctx context.Context, uri span.URI) []CheckPackageHandle
+	GetActiveReverseDeps(ctx context.Context, f File) []CheckPackageHandle
+
+	// Snapshot returns the current snapshot for the view.
+	Snapshot() Snapshot
+}
+
+// Snapshot represents the current state for the given view.
+type Snapshot interface {
+	// Handle returns the FileHandle for the given file.
+	Handle(ctx context.Context, f File) FileHandle
+
+	// View returns the View associated with this snapshot.
+	View() View
+
+	// Analyze runs the analyses for the given package at this snapshot.
+	Analyze(ctx context.Context, id string, analyzers []*analysis.Analyzer) (map[*analysis.Analyzer][]*analysis.Diagnostic, error)
 }
 
 // File represents a source file of any type.
 type File interface {
 	URI() span.URI
-	View() View
-	Handle(ctx context.Context) FileHandle
-}
-
-// GoFile represents a Go source file that has been type-checked.
-type GoFile interface {
-	File
-
-	// GetCheckPackageHandles returns the CheckPackageHandles for the packages
-	// that this file belongs to.
-	CheckPackageHandles(ctx context.Context) ([]CheckPackageHandle, error)
-}
-
-type ModFile interface {
-	File
-}
-
-type SumFile interface {
-	File
+	Kind() FileKind
 }
 
 // Package represents a Go package that has been type-checked. It maintains
@@ -303,9 +290,6 @@ type Package interface {
 
 	// GetImport returns the CheckPackageHandle for a package imported by this package.
 	GetImport(ctx context.Context, pkgPath string) (Package, error)
-
-	// GetActionGraph returns the action graph for the given package.
-	GetActionGraph(ctx context.Context, a *analysis.Analyzer) (*Action, error)
 
 	// FindFile returns the AST and type information for a file that may
 	// belong to or be part of a dependency of the given package.

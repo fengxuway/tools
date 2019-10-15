@@ -20,7 +20,7 @@ func (s *Server) completion(ctx context.Context, params *protocol.CompletionPara
 	uri := span.NewURI(params.TextDocument.URI)
 	view := s.session.ViewOf(uri)
 	options := view.Options()
-	f, err := getGoFile(ctx, view, uri)
+	f, err := view.GetFile(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +46,7 @@ func (s *Server) completion(ctx context.Context, params *protocol.CompletionPara
 	return &protocol.CompletionList{
 		// When using deep completions/fuzzy matching, report results as incomplete so
 		// client fetches updated completions after every key stroke.
-		IsIncomplete: options.Completion.Deep,
+		IsIncomplete: options.Completion.Deep || options.Completion.FuzzyMatching,
 		Items:        toProtocolCompletionItems(candidates, rng, options),
 	}, nil
 }
@@ -82,7 +82,7 @@ func toProtocolCompletionItems(candidates []source.CompletionItem, rng protocol.
 		item := protocol.CompletionItem{
 			Label:  candidate.Label,
 			Detail: candidate.Detail,
-			Kind:   toProtocolCompletionItemKind(candidate.Kind),
+			Kind:   candidate.Kind,
 			TextEdit: &protocol.TextEdit{
 				NewText: insertText,
 				Range:   rng,
@@ -109,29 +109,4 @@ func toProtocolCompletionItems(candidates []source.CompletionItem, rng protocol.
 		items = append(items, item)
 	}
 	return items
-}
-
-func toProtocolCompletionItemKind(kind source.CompletionItemKind) protocol.CompletionItemKind {
-	switch kind {
-	case source.InterfaceCompletionItem:
-		return protocol.InterfaceCompletion
-	case source.StructCompletionItem:
-		return protocol.StructCompletion
-	case source.TypeCompletionItem:
-		return protocol.TypeParameterCompletion // ??
-	case source.ConstantCompletionItem:
-		return protocol.ConstantCompletion
-	case source.FieldCompletionItem:
-		return protocol.FieldCompletion
-	case source.ParameterCompletionItem, source.VariableCompletionItem:
-		return protocol.VariableCompletion
-	case source.FunctionCompletionItem:
-		return protocol.FunctionCompletion
-	case source.MethodCompletionItem:
-		return protocol.MethodCompletion
-	case source.PackageCompletionItem:
-		return protocol.ModuleCompletion // ??
-	default:
-		return protocol.TextCompletion
-	}
 }

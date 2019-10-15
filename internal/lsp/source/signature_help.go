@@ -27,15 +27,18 @@ type ParameterInformation struct {
 	Label string
 }
 
-func SignatureHelp(ctx context.Context, view View, f GoFile, pos protocol.Position) (*SignatureInformation, error) {
+func SignatureHelp(ctx context.Context, view View, f File, pos protocol.Position) (*SignatureInformation, error) {
 	ctx, done := trace.StartSpan(ctx, "source.SignatureHelp")
 	defer done()
 
-	cphs, err := f.CheckPackageHandles(ctx)
+	_, cphs, err := view.CheckPackageHandles(ctx, f)
 	if err != nil {
 		return nil, err
 	}
-	cph := NarrowestCheckPackageHandle(cphs)
+	cph, err := NarrowestCheckPackageHandle(cphs)
+	if err != nil {
+		return nil, err
+	}
 	pkg, err := cph.Check(ctx)
 	if err != nil {
 		return nil, err
@@ -94,7 +97,7 @@ FindCall:
 
 	// Handle builtin functions separately.
 	if obj, ok := obj.(*types.Builtin); ok {
-		return builtinSignature(ctx, f.View(), callExpr, obj.Name(), rng.Start)
+		return builtinSignature(ctx, view, callExpr, obj.Name(), rng.Start)
 	}
 
 	// Get the type information for the function being called.
@@ -118,7 +121,7 @@ FindCall:
 		comment *ast.CommentGroup
 	)
 	if obj != nil {
-		node, err := objToNode(ctx, f.View(), pkg, obj)
+		node, err := objToNode(ctx, view, pkg, obj)
 		if err != nil {
 			return nil, err
 		}

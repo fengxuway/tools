@@ -56,9 +56,9 @@ func (s mappedRange) URI() span.URI {
 // By "narrowest" package, we mean the package with the fewest number of files
 // that includes the given file. This solves the problem of test variants,
 // as the test will have more files than the non-test package.
-func NarrowestCheckPackageHandle(handles []CheckPackageHandle) CheckPackageHandle {
+func NarrowestCheckPackageHandle(handles []CheckPackageHandle) (CheckPackageHandle, error) {
 	if len(handles) < 1 {
-		return nil
+		return nil, errors.Errorf("no CheckPackageHandles")
 	}
 	result := handles[0]
 	for _, handle := range handles[1:] {
@@ -66,16 +66,19 @@ func NarrowestCheckPackageHandle(handles []CheckPackageHandle) CheckPackageHandl
 			result = handle
 		}
 	}
-	return result
+	if result == nil {
+		return nil, errors.Errorf("nil CheckPackageHandles have been returned")
+	}
+	return result, nil
 }
 
 // WidestCheckPackageHandle returns the CheckPackageHandle containing the most files.
 //
 // This is useful for something like diagnostics, where we'd prefer to offer diagnostics
 // for as many files as possible.
-func WidestCheckPackageHandle(handles []CheckPackageHandle) CheckPackageHandle {
+func WidestCheckPackageHandle(handles []CheckPackageHandle) (CheckPackageHandle, error) {
 	if len(handles) < 1 {
-		return nil
+		return nil, errors.Errorf("no CheckPackageHandles")
 	}
 	result := handles[0]
 	for _, handle := range handles[1:] {
@@ -83,7 +86,10 @@ func WidestCheckPackageHandle(handles []CheckPackageHandle) CheckPackageHandle {
 			result = handle
 		}
 	}
-	return result
+	if result == nil {
+		return nil, errors.Errorf("nil CheckPackageHandles have been returned")
+	}
+	return result, nil
 }
 
 func IsGenerated(ctx context.Context, view View, uri span.URI) bool {
@@ -91,7 +97,7 @@ func IsGenerated(ctx context.Context, view View, uri span.URI) bool {
 	if err != nil {
 		return false
 	}
-	ph := view.Session().Cache().ParseGoHandle(f.Handle(ctx), ParseHeader)
+	ph := view.Session().Cache().ParseGoHandle(view.Snapshot().Handle(ctx, f), ParseHeader)
 	parsed, _, _, err := ph.Parse(ctx)
 	if err != nil {
 		return false
@@ -398,18 +404,18 @@ func formatResults(tup *types.Tuple, qf types.Qualifier) ([]string, bool) {
 }
 
 // formatType returns the detail and kind for an object of type *types.TypeName.
-func formatType(typ types.Type, qf types.Qualifier) (detail string, kind CompletionItemKind) {
+func formatType(typ types.Type, qf types.Qualifier) (detail string, kind protocol.CompletionItemKind) {
 	if types.IsInterface(typ) {
 		detail = "interface{...}"
-		kind = InterfaceCompletionItem
+		kind = protocol.InterfaceCompletion
 	} else if _, ok := typ.(*types.Struct); ok {
 		detail = "struct{...}"
-		kind = StructCompletionItem
+		kind = protocol.StructCompletion
 	} else if typ != typ.Underlying() {
 		detail, kind = formatType(typ.Underlying(), qf)
 	} else {
 		detail = types.TypeString(typ, qf)
-		kind = TypeCompletionItem
+		kind = protocol.ClassCompletion
 	}
 	return detail, kind
 }
