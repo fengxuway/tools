@@ -1,27 +1,21 @@
-# Go Tools
+# 魔改版goimports
 
-This subrepository holds the source for various packages and tools that support
-the Go programming language.
 
-Some of the tools, `godoc` and `vet` for example, are included in binary Go
-distributions.
+本库继承自<https://godoc.org/golang.org/x/tools>
 
-Others, including the Go `guru` and the test coverage tool, can be fetched with
-`go get`.
+修改goimports工具，使支持去除`import`段多余的空行，并按照：Go内建包/第三方依赖包/咱公司内部依赖包分组。
 
-Packages include a type-checker for Go and an implementation of the
-Static Single Assignment form (SSA) representation for Go programs.
+效果：
 
-## Download/Install
+![](http://git.intra.weibo.com/fengxu6/goimports/uploads/e487191ce90b7ea6adfa560624081e6a/1.gif)
 
-The easiest way to install is to run `go get -u golang.org/x/tools/...`. You can
-also manually git clone the repository to `$GOPATH/src/golang.org/x/tools`.
+### 用法
 
-## Report Issues / Send Patches
+```
+cd cmd/goimports
+go build
+cp goimports $GOPATH/bin/
+```
 
-This repository uses Gerrit for code changes. To learn how to submit changes to
-this repository, see https://golang.org/doc/contribute.html.
 
-The main issue tracker for the tools repository is located at
-https://github.com/golang/go/issues. Prefix your issue with "x/tools/(your
-subdir):" in the subject line, so it is easy to find.
+> 说明：代码中把`goimports -local=`参数写死为域名“git.intra.weibo.com”的原因是，部分编辑器（包含GoLand/VSCode等）暂不支持格式化工具添加自定义参数。
