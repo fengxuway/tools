@@ -14,13 +14,16 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/imports"
 	"golang.org/x/tools/internal/lsp/debug"
+	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/telemetry/log"
+	"golang.org/x/tools/internal/telemetry/tag"
 	"golang.org/x/tools/internal/xcontext"
 	errors "golang.org/x/xerrors"
 )
@@ -58,7 +61,8 @@ type view struct {
 	// TODO(suzmue): the state cached in the process env is specific to each view,
 	// however, there is state that can be shared between views that is not currently
 	// cached, like the module cache.
-	processEnv *imports.ProcessEnv
+	processEnv       *imports.ProcessEnv
+	cacheRefreshTime time.Time
 
 	// modFileVersions stores the last seen versions of the module files that are used
 	// by processEnvs resolver.
@@ -124,7 +128,9 @@ func (v *view) Config(ctx context.Context) *packages.Config {
 			panic("go/packages must not be used to parse files")
 		},
 		Logf: func(format string, args ...interface{}) {
-			log.Print(ctx, fmt.Sprintf(format, args...))
+			if v.options.VerboseOutput {
+				log.Print(ctx, fmt.Sprintf(format, args...))
+			}
 		},
 		Tests: true,
 	}
@@ -142,15 +148,7 @@ func (v *view) RunProcessEnvFunc(ctx context.Context, fn func(*imports.Options) 
 
 	// Before running the user provided function, clear caches in the resolver.
 	if v.modFilesChanged() {
-		if r, ok := v.processEnv.GetResolver().(*imports.ModuleResolver); ok {
-			// Clear the resolver cache and set Initialized to false.
-			r.Initialized = false
-			r.Main = nil
-			r.ModsByModPath = nil
-			r.ModsByDir = nil
-			// Reset the modFileVersions.
-			v.modFileVersions = nil
-		}
+		v.processEnv.GetResolver().(*imports.ModuleResolver).ClearForNewMod()
 	}
 
 	// Run the user function.
@@ -158,10 +156,26 @@ func (v *view) RunProcessEnvFunc(ctx context.Context, fn func(*imports.Options) 
 	if err := fn(opts); err != nil {
 		return err
 	}
+	if v.cacheRefreshTime.IsZero() {
+		v.cacheRefreshTime = time.Now()
+	}
 
 	// If applicable, store the file versions of the 'go.mod' files that are
 	// looked at by the resolver.
 	v.storeModFileVersions()
+
+	if time.Since(v.cacheRefreshTime) > 30*time.Second {
+		go func() {
+			v.mu.Lock()
+			defer v.mu.Unlock()
+
+			log.Print(context.Background(), "background imports cache refresh starting")
+			v.processEnv.GetResolver().ClearForNewScan()
+			_, err := imports.GetAllCandidates("", opts)
+			v.cacheRefreshTime = time.Now()
+			log.Print(context.Background(), "background refresh finished with err: ", tag.Of("err", err))
+		}()
+	}
 
 	return nil
 }
@@ -173,6 +187,8 @@ func (v *view) buildProcessEnv(ctx context.Context) (*imports.ProcessEnv, error)
 		Logf: func(format string, args ...interface{}) {
 			log.Print(ctx, fmt.Sprintf(format, args...))
 		},
+		LocalPrefix: v.options.LocalPrefix,
+		Debug:       v.options.VerboseOutput,
 	}
 	for _, kv := range cfg.Env {
 		split := strings.Split(kv, "=")
@@ -351,9 +367,9 @@ func (v *view) getFile(ctx context.Context, uri span.URI, kind source.FileKind) 
 		fname: uri.Filename(),
 		kind:  source.Go,
 	}
-	v.session.filesWatchMap.Watch(uri, func() {
+	v.session.filesWatchMap.Watch(uri, func(changeType protocol.FileChangeType) bool {
 		ctx := xcontext.Detach(ctx)
-		v.invalidateContent(ctx, uri, kind)
+		return v.invalidateContent(ctx, f, kind, changeType)
 	})
 	v.mapFile(uri, f)
 	return f, nil
@@ -418,6 +434,14 @@ func (v *view) openFiles(ctx context.Context, uris []span.URI) (results []source
 		}
 	}
 	return results
+}
+
+func (v *view) FindFileInPackage(ctx context.Context, uri span.URI, pkg source.Package) (source.ParseGoHandle, source.Package, error) {
+	// Special case for ignored files.
+	if v.Ignore(uri) {
+		return v.findIgnoredFile(ctx, uri)
+	}
+	return findFileInPackage(ctx, uri, pkg)
 }
 
 type debugView struct{ *view }

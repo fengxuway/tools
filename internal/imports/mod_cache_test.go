@@ -2,6 +2,7 @@ package imports
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"testing"
 )
@@ -53,8 +54,8 @@ func TestDirectoryPackageInfoReachedStatus(t *testing.T) {
 }
 
 func TestModCacheInfo(t *testing.T) {
-	m := &moduleCacheInfo{
-		modCacheDirInfo: make(map[string]*directoryPackageInfo),
+	m := &dirInfoCache{
+		dirs: make(map[string]*directoryPackageInfo),
 	}
 
 	dirInfo := []struct {
@@ -97,7 +98,7 @@ func TestModCacheInfo(t *testing.T) {
 			t.Errorf("directory not loaded: %s", d.dir)
 		}
 
-		if val != d.info {
+		if !reflect.DeepEqual(d.info, val) {
 			t.Errorf("expected: %v, got: %v", d.info, val)
 		}
 	}

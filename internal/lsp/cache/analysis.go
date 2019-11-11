@@ -12,12 +12,13 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/lsp/telemetry"
 	"golang.org/x/tools/internal/memoize"
 	"golang.org/x/tools/internal/telemetry/log"
 	errors "golang.org/x/xerrors"
 )
 
-func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*analysis.Analyzer) (map[*analysis.Analyzer][]*analysis.Diagnostic, error) {
+func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*analysis.Analyzer) ([]*source.Error, error) {
 	var roots []*actionHandle
 
 	for _, a := range analyzers {
@@ -25,7 +26,6 @@ func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*analysis
 		if err != nil {
 			return nil, err
 		}
-		ah.isroot = true
 		roots = append(roots, ah)
 	}
 
@@ -34,14 +34,14 @@ func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*analysis
 		return nil, ctx.Err()
 	}
 
-	results := make(map[*analysis.Analyzer][]*analysis.Diagnostic)
+	var results []*source.Error
 	for _, ah := range roots {
 		diagnostics, _, err := ah.analyze(ctx)
 		if err != nil {
 			log.Error(ctx, "no results", err)
 			continue
 		}
-		results[ah.analyzer] = diagnostics
+		results = append(results, diagnostics...)
 	}
 	return results, nil
 }
@@ -53,19 +53,16 @@ func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*analysis
 type actionHandle struct {
 	handle *memoize.Handle
 
-	analyzer     *analysis.Analyzer
-	deps         []*actionHandle
-	pkg          *pkg
-	pass         *analysis.Pass
-	isroot       bool
-	objectFacts  map[objectFactKey]analysis.Fact
-	packageFacts map[packageFactKey]analysis.Fact
+	analyzer *analysis.Analyzer
+	pkg      *pkg
 }
 
 type actionData struct {
-	diagnostics []*analysis.Diagnostic
-	result      interface{}
-	err         error
+	diagnostics  []*source.Error
+	result       interface{}
+	objectFacts  map[objectFactKey]analysis.Fact
+	packageFacts map[packageFactKey]analysis.Fact
+	err          error
 }
 
 type objectFactKey struct {
@@ -79,6 +76,10 @@ type packageFactKey struct {
 }
 
 func (s *snapshot) actionHandle(ctx context.Context, id packageID, mode source.ParseMode, a *analysis.Analyzer) (*actionHandle, error) {
+	ah := s.getAction(id, mode, a)
+	if ah != nil {
+		return ah, nil
+	}
 	cph := s.getPackage(id, mode)
 	if cph == nil {
 		return nil, errors.Errorf("no CheckPackageHandle for %s:%v", id, mode == source.ParseExported)
@@ -90,17 +91,18 @@ func (s *snapshot) actionHandle(ctx context.Context, id packageID, mode source.P
 	if err != nil {
 		return nil, err
 	}
-	ah := &actionHandle{
+	ah = &actionHandle{
 		analyzer: a,
 		pkg:      pkg,
 	}
+	var deps []*actionHandle
 	// Add a dependency on each required analyzers.
 	for _, req := range a.Requires {
 		reqActionHandle, err := s.actionHandle(ctx, id, mode, req)
 		if err != nil {
 			return nil, err
 		}
-		ah.deps = append(ah.deps, reqActionHandle)
+		deps = append(deps, reqActionHandle)
 	}
 	// An analysis that consumes/produces facts
 	// must run on the package's dependencies too.
@@ -115,148 +117,240 @@ func (s *snapshot) actionHandle(ctx context.Context, id packageID, mode source.P
 			if err != nil {
 				return nil, err
 			}
-			ah.deps = append(ah.deps, depActionHandle)
+			deps = append(deps, depActionHandle)
 		}
 	}
-	h := s.view.session.cache.store.Bind(actionKey(a, cph), func(ctx context.Context) interface{} {
-		data := &actionData{}
-		data.diagnostics, data.result, data.err = ah.exec(ctx, s.view.session.cache.fset)
-		return data
+
+	fset := s.view.session.cache.fset
+
+	h := s.view.session.cache.store.Bind(buildActionKey(a, cph), func(ctx context.Context) interface{} {
+		// Analyze dependencies first.
+		results, err := execAll(ctx, fset, deps)
+		if err != nil {
+			return &actionData{
+				err: err,
+			}
+		}
+		return runAnalysis(ctx, fset, a, pkg, results)
 	})
 	ah.handle = h
+
+	s.addAction(ah)
 	return ah, nil
 }
 
-func (ah *actionHandle) analyze(ctx context.Context) ([]*analysis.Diagnostic, interface{}, error) {
-	v := ah.handle.Get(ctx)
+func (act *actionHandle) analyze(ctx context.Context) ([]*source.Error, interface{}, error) {
+	v := act.handle.Get(ctx)
 	if v == nil {
-		return nil, nil, errors.Errorf("no analyses for %s", ah.pkg.ID())
+		return nil, nil, errors.Errorf("no analyses for %s", act.pkg.ID())
 	}
-	data := v.(*actionData)
+	data, ok := v.(*actionData)
+	if !ok {
+		return nil, nil, errors.Errorf("unexpected type for %s:%s", act.pkg.ID(), act.analyzer.Name)
+	}
+	if data == nil {
+		return nil, nil, errors.Errorf("unexpected nil analysis for %s:%s", act.pkg.ID(), act.analyzer.Name)
+	}
 	return data.diagnostics, data.result, data.err
 }
 
-func actionKey(a *analysis.Analyzer, cph *checkPackageHandle) string {
-	return hashContents([]byte(fmt.Sprintf("%s %s", a, string(cph.key))))
+func (act *actionHandle) cached() ([]*source.Error, interface{}, error) {
+	v := act.handle.Cached()
+	if v == nil {
+		return nil, nil, errors.Errorf("no analyses for %s", act.pkg.ID())
+	}
+	data, ok := v.(*actionData)
+	if !ok {
+		return nil, nil, errors.Errorf("unexpected type for %s:%s", act.pkg.ID(), act.analyzer.Name)
+	}
+	if data == nil {
+		return nil, nil, errors.Errorf("unexpected nil cached analysis for %s:%s", act.pkg.ID(), act.analyzer.Name)
+	}
+	return data.diagnostics, data.result, data.err
+}
+
+func buildActionKey(a *analysis.Analyzer, cph *checkPackageHandle) string {
+	return hashContents([]byte(fmt.Sprintf("%p %s", a, string(cph.key))))
 }
 
 func (act *actionHandle) String() string {
 	return fmt.Sprintf("%s@%s", act.analyzer, act.pkg.PkgPath())
 }
 
-func execAll(ctx context.Context, fset *token.FileSet, actions []*actionHandle) (map[*actionHandle][]*analysis.Diagnostic, map[*actionHandle]interface{}, error) {
-	var (
-		mu          sync.Mutex
-		diagnostics = make(map[*actionHandle][]*analysis.Diagnostic)
-		results     = make(map[*actionHandle]interface{})
-	)
+func execAll(ctx context.Context, fset *token.FileSet, actions []*actionHandle) (map[*actionHandle]*actionData, error) {
+	var mu sync.Mutex
+	results := make(map[*actionHandle]*actionData)
 
 	g, ctx := errgroup.WithContext(ctx)
 	for _, act := range actions {
 		act := act
 		g.Go(func() error {
-			d, r, err := act.analyze(ctx)
-			if err != nil {
-				return err
+			v := act.handle.Get(ctx)
+			if v == nil {
+				return errors.Errorf("no analyses for %s", act.pkg.ID())
+			}
+			data, ok := v.(*actionData)
+			if !ok {
+				return errors.Errorf("unexpected type for %s: %T", act, v)
 			}
 
 			mu.Lock()
 			defer mu.Unlock()
-
-			diagnostics[act] = d
-			results[act] = r
+			results[act] = data
 
 			return nil
 		})
 	}
-	return diagnostics, results, g.Wait()
+	return results, g.Wait()
 }
 
-func (act *actionHandle) exec(ctx context.Context, fset *token.FileSet) (diagnostics []*analysis.Diagnostic, result interface{}, err error) {
-	// Analyze dependencies.
-	_, depResults, err := execAll(ctx, fset, act.deps)
-	if err != nil {
-		return nil, nil, err
+func runAnalysis(ctx context.Context, fset *token.FileSet, analyzer *analysis.Analyzer, pkg *pkg, deps map[*actionHandle]*actionData) (data *actionData) {
+	data = &actionData{
+		objectFacts:  make(map[objectFactKey]analysis.Fact),
+		packageFacts: make(map[packageFactKey]analysis.Fact),
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Print(ctx, fmt.Sprintf("analysis panicked: %s", r), telemetry.Package.Of(pkg.PkgPath))
+			data.err = errors.Errorf("analysis %s for package %s panicked: %v", analyzer.Name, pkg.PkgPath())
+		}
+	}()
 
 	// Plumb the output values of the dependencies
 	// into the inputs of this action.  Also facts.
 	inputs := make(map[*analysis.Analyzer]interface{})
-	act.objectFacts = make(map[objectFactKey]analysis.Fact)
-	act.packageFacts = make(map[packageFactKey]analysis.Fact)
-	for _, dep := range act.deps {
-		if dep.pkg == act.pkg {
+
+	for depHandle, depData := range deps {
+		if depHandle.pkg == pkg {
 			// Same package, different analysis (horizontal edge):
 			// in-memory outputs of prerequisite analyzers
 			// become inputs to this analysis pass.
-			inputs[dep.analyzer] = depResults[dep]
-		} else if dep.analyzer == act.analyzer { // (always true)
+			inputs[depHandle.analyzer] = depData.result
+		} else if depHandle.analyzer == analyzer { // (always true)
 			// Same analysis, different package (vertical edge):
 			// serialized facts produced by prerequisite analysis
 			// become available to this analysis pass.
-			inheritFacts(act, dep)
-		}
-	}
+			for key, fact := range depData.objectFacts {
+				// Filter out facts related to objects
+				// that are irrelevant downstream
+				// (equivalently: not in the compiler export data).
+				if !exportedFrom(key.obj, depHandle.pkg.types) {
+					continue
+				}
+				data.objectFacts[key] = fact
+			}
+			for key, fact := range depData.packageFacts {
+				// TODO: filter out facts that belong to
+				// packages not mentioned in the export data
+				// to prevent side channels.
 
-	// Run the analysis.
-	pass := &analysis.Pass{
-		Analyzer:          act.analyzer,
-		Fset:              fset,
-		Files:             act.pkg.GetSyntax(ctx),
-		Pkg:               act.pkg.GetTypes(),
-		TypesInfo:         act.pkg.GetTypesInfo(),
-		TypesSizes:        act.pkg.GetTypesSizes(),
-		ResultOf:          inputs,
-		Report:            func(d analysis.Diagnostic) { diagnostics = append(diagnostics, &d) },
-		ImportObjectFact:  act.importObjectFact,
-		ExportObjectFact:  act.exportObjectFact,
-		ImportPackageFact: act.importPackageFact,
-		ExportPackageFact: act.exportPackageFact,
-		AllObjectFacts:    act.allObjectFacts,
-		AllPackageFacts:   act.allPackageFacts,
-	}
-	act.pass = pass
-
-	if act.pkg.IsIllTyped() {
-		return nil, nil, errors.Errorf("analysis skipped due to errors in package: %v", act.pkg.GetErrors())
-	} else {
-		result, err = pass.Analyzer.Run(pass)
-		if err == nil {
-			if got, want := reflect.TypeOf(result), pass.Analyzer.ResultType; got != want {
-				err = errors.Errorf(
-					"internal error: on package %s, analyzer %s returned a result of type %v, but declared ResultType %v",
-					pass.Pkg.Path(), pass.Analyzer, got, want)
+				data.packageFacts[key] = fact
 			}
 		}
 	}
 
-	// disallow calls after Run
-	pass.ExportObjectFact = nil
-	pass.ExportPackageFact = nil
+	var diagnostics []*analysis.Diagnostic
 
-	return diagnostics, result, err
-}
+	// Run the analysis.
+	pass := &analysis.Pass{
+		Analyzer:   analyzer,
+		Fset:       fset,
+		Files:      pkg.GetSyntax(),
+		Pkg:        pkg.GetTypes(),
+		TypesInfo:  pkg.GetTypesInfo(),
+		TypesSizes: pkg.GetTypesSizes(),
+		ResultOf:   inputs,
+		Report: func(d analysis.Diagnostic) {
+			// Prefix the diagnostic category with the analyzer's name.
+			if d.Category == "" {
+				d.Category = analyzer.Name
+			} else {
+				d.Category = analyzer.Name + "." + d.Category
+			}
+			diagnostics = append(diagnostics, &d)
+		},
+		ImportObjectFact: func(obj types.Object, ptr analysis.Fact) bool {
+			if obj == nil {
+				panic("nil object")
+			}
+			key := objectFactKey{obj, factType(ptr)}
 
-// inheritFacts populates act.facts with
-// those it obtains from its dependency, dep.
-func inheritFacts(act, dep *actionHandle) {
-	for key, fact := range dep.objectFacts {
-		// Filter out facts related to objects
-		// that are irrelevant downstream
-		// (equivalently: not in the compiler export data).
-		if !exportedFrom(key.obj, dep.pkg.types) {
-			continue
+			if v, ok := data.objectFacts[key]; ok {
+				reflect.ValueOf(ptr).Elem().Set(reflect.ValueOf(v).Elem())
+				return true
+			}
+			return false
+		},
+		ExportObjectFact: func(obj types.Object, fact analysis.Fact) {
+			if obj.Pkg() != pkg.types {
+				panic(fmt.Sprintf("internal error: in analysis %s of package %s: Fact.Set(%s, %T): can't set facts on objects belonging another package",
+					analyzer, pkg.ID(), obj, fact))
+			}
+			key := objectFactKey{obj, factType(fact)}
+			data.objectFacts[key] = fact // clobber any existing entry
+		},
+		ImportPackageFact: func(pkg *types.Package, ptr analysis.Fact) bool {
+			if pkg == nil {
+				panic("nil package")
+			}
+			key := packageFactKey{pkg, factType(ptr)}
+			if v, ok := data.packageFacts[key]; ok {
+				reflect.ValueOf(ptr).Elem().Set(reflect.ValueOf(v).Elem())
+				return true
+			}
+			return false
+		},
+		ExportPackageFact: func(fact analysis.Fact) {
+			key := packageFactKey{pkg.types, factType(fact)}
+			data.packageFacts[key] = fact // clobber any existing entry
+		},
+		AllObjectFacts: func() []analysis.ObjectFact {
+			facts := make([]analysis.ObjectFact, 0, len(data.objectFacts))
+			for k := range data.objectFacts {
+				facts = append(facts, analysis.ObjectFact{Object: k.obj, Fact: data.objectFacts[k]})
+			}
+			return facts
+		},
+		AllPackageFacts: func() []analysis.PackageFact {
+			facts := make([]analysis.PackageFact, 0, len(data.packageFacts))
+			for k := range data.packageFacts {
+				facts = append(facts, analysis.PackageFact{Package: k.pkg, Fact: data.packageFacts[k]})
+			}
+			return facts
+		},
+	}
+
+	if pkg.IsIllTyped() {
+		data.err = errors.Errorf("analysis skipped due to errors in package: %v", pkg.GetErrors())
+		return data
+	}
+	data.result, data.err = pass.Analyzer.Run(pass)
+	if data.err == nil {
+		if got, want := reflect.TypeOf(data.result), pass.Analyzer.ResultType; got != want {
+			data.err = errors.Errorf(
+				"internal error: on package %s, analyzer %s returned a result of type %v, but declared ResultType %v",
+				pass.Pkg.Path(), pass.Analyzer, got, want)
+			return data
 		}
-		act.objectFacts[key] = fact
 	}
 
-	for key, fact := range dep.packageFacts {
-		// TODO: filter out facts that belong to
-		// packages not mentioned in the export data
-		// to prevent side channels.
-
-		act.packageFacts[key] = fact
+	// disallow calls after Run
+	pass.ExportObjectFact = func(obj types.Object, fact analysis.Fact) {
+		panic(fmt.Sprintf("%s:%s: Pass.ExportObjectFact(%s, %T) called after Run", analyzer.Name, pkg.PkgPath(), obj, fact))
 	}
+	pass.ExportPackageFact = func(fact analysis.Fact) {
+		panic(fmt.Sprintf("%s:%s: Pass.ExportPackageFact(%T) called after Run", analyzer.Name, pkg.PkgPath(), fact))
+	}
+
+	for _, diag := range diagnostics {
+		srcErr, err := sourceError(ctx, fset, pkg, diag)
+		if err != nil {
+			data.err = err
+			return data
+		}
+		data.diagnostics = append(data.diagnostics, srcErr)
+	}
+	return data
 }
 
 // exportedFrom reports whether obj may be visible to a package that imports pkg.
@@ -281,83 +375,10 @@ func exportedFrom(obj types.Object, pkg *types.Package) bool {
 	return false // Nil, Builtin, Label, or PkgName
 }
 
-// importObjectFact implements Pass.ImportObjectFact.
-// Given a non-nil pointer ptr of type *T, where *T satisfies Fact,
-// importObjectFact copies the fact value to *ptr.
-func (act *actionHandle) importObjectFact(obj types.Object, ptr analysis.Fact) bool {
-	if obj == nil {
-		panic("nil object")
-	}
-	key := objectFactKey{obj, factType(ptr)}
-	if v, ok := act.objectFacts[key]; ok {
-		reflect.ValueOf(ptr).Elem().Set(reflect.ValueOf(v).Elem())
-		return true
-	}
-	return false
-}
-
-// exportObjectFact implements Pass.ExportObjectFact.
-func (act *actionHandle) exportObjectFact(obj types.Object, fact analysis.Fact) {
-	if act.pass.ExportObjectFact == nil {
-		panic(fmt.Sprintf("%s: Pass.ExportObjectFact(%s, %T) called after Run", act, obj, fact))
-	}
-
-	if obj.Pkg() != act.pkg.types {
-		panic(fmt.Sprintf("internal error: in analysis %s of package %s: Fact.Set(%s, %T): can't set facts on objects belonging another package",
-			act.analyzer, act.pkg.ID(), obj, fact))
-	}
-
-	key := objectFactKey{obj, factType(fact)}
-	act.objectFacts[key] = fact // clobber any existing entry
-}
-
-// allObjectFacts implements Pass.AllObjectFacts.
-func (act *actionHandle) allObjectFacts() []analysis.ObjectFact {
-	facts := make([]analysis.ObjectFact, 0, len(act.objectFacts))
-	for k := range act.objectFacts {
-		facts = append(facts, analysis.ObjectFact{Object: k.obj, Fact: act.objectFacts[k]})
-	}
-	return facts
-}
-
-// importPackageFact implements Pass.ImportPackageFact.
-// Given a non-nil pointer ptr of type *T, where *T satisfies Fact,
-// fact copies the fact value to *ptr.
-func (act *actionHandle) importPackageFact(pkg *types.Package, ptr analysis.Fact) bool {
-	if pkg == nil {
-		panic("nil package")
-	}
-	key := packageFactKey{pkg, factType(ptr)}
-	if v, ok := act.packageFacts[key]; ok {
-		reflect.ValueOf(ptr).Elem().Set(reflect.ValueOf(v).Elem())
-		return true
-	}
-	return false
-}
-
-// exportPackageFact implements Pass.ExportPackageFact.
-func (act *actionHandle) exportPackageFact(fact analysis.Fact) {
-	if act.pass.ExportPackageFact == nil {
-		panic(fmt.Sprintf("%s: Pass.ExportPackageFact(%T) called after Run", act, fact))
-	}
-
-	key := packageFactKey{act.pass.Pkg, factType(fact)}
-	act.packageFacts[key] = fact // clobber any existing entry
-}
-
 func factType(fact analysis.Fact) reflect.Type {
 	t := reflect.TypeOf(fact)
 	if t.Kind() != reflect.Ptr {
 		panic(fmt.Sprintf("invalid Fact type: got %T, want pointer", t))
 	}
 	return t
-}
-
-// allObjectFacts implements Pass.AllObjectFacts.
-func (act *actionHandle) allPackageFacts() []analysis.PackageFact {
-	facts := make([]analysis.PackageFact, 0, len(act.packageFacts))
-	for k := range act.packageFacts {
-		facts = append(facts, analysis.PackageFact{Package: k.pkg, Fact: act.packageFacts[k]})
-	}
-	return facts
 }

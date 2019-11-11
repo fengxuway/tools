@@ -53,7 +53,10 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 	options := tests.DefaultOptions()
 	session.SetOptions(options)
 	options.Env = data.Config.Env
-	session.NewView(ctx, viewName, span.FileURI(data.Config.Dir), options)
+	_, err := session.NewView(ctx, viewName, span.FileURI(data.Config.Dir), options)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for filename, content := range data.Config.Overlay {
 		session.SetOverlay(span.FileURI(filename), source.DetectLanguage("", filename), content)
 	}
@@ -88,7 +91,7 @@ func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []source.Diagnosti
 		}
 		return
 	}
-	if diff := tests.DiffDiagnostics(uri, want, got); diff != "" {
+	if diff := tests.DiffDiagnostics(want, got); diff != "" {
 		t.Error(diff)
 	}
 }
@@ -426,6 +429,44 @@ func (r *runner) Definition(t *testing.T, spn span.Span, d tests.Definition) {
 	}
 }
 
+func (r *runner) Implementation(t *testing.T, spn span.Span, m tests.Implementations) {
+	sm, err := r.data.Mapper(m.Src.URI())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc, err := sm.Location(m.Src)
+	if err != nil {
+		t.Fatalf("failed for %v: %v", m.Src, err)
+	}
+	tdpp := protocol.TextDocumentPositionParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: loc.URI},
+		Position:     loc.Range.Start,
+	}
+	var locs []protocol.Location
+	params := &protocol.ImplementationParams{
+		TextDocumentPositionParams: tdpp,
+	}
+	locs, err = r.server.Implementation(r.ctx, params)
+	if err != nil {
+		t.Fatalf("failed for %v: %v", m.Src, err)
+	}
+	if len(locs) != len(m.Implementations) {
+		t.Fatalf("got %d locations for implementation, expected %d", len(locs), len(m.Implementations))
+	}
+	for i := range locs {
+		locURI := span.NewURI(locs[i].URI)
+		lm, err := r.data.Mapper(locURI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if imp, err := lm.Span(locs[i]); err != nil {
+			t.Fatalf("failed for %v: %v", locs[i], err)
+		} else if imp != m.Implementations[i] {
+			t.Errorf("for %dth implementation of %v got %v want %v", i, m.Src, imp, m.Implementations[i])
+		}
+	}
+}
+
 func (r *runner) Highlight(t *testing.T, name string, locations []span.Span) {
 	m, err := r.data.Mapper(locations[0].URI())
 	if err != nil {
@@ -458,7 +499,7 @@ func (r *runner) Highlight(t *testing.T, name string, locations []span.Span) {
 	}
 }
 
-func (r *runner) Reference(t *testing.T, src span.Span, itemList []span.Span) {
+func (r *runner) References(t *testing.T, src span.Span, itemList []span.Span) {
 	sm, err := r.data.Mapper(src.URI())
 	if err != nil {
 		t.Fatal(err)
@@ -616,7 +657,7 @@ func applyEdits(contents string, edits []diff.TextEdit) string {
 	return res
 }
 
-func (r *runner) Symbol(t *testing.T, uri span.URI, expectedSymbols []protocol.DocumentSymbol) {
+func (r *runner) Symbols(t *testing.T, uri span.URI, expectedSymbols []protocol.DocumentSymbol) {
 	params := &protocol.DocumentSymbolParams{
 		TextDocument: protocol.TextDocumentIdentifier{
 			URI: string(uri),
@@ -759,7 +800,7 @@ func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotLinks, err := r.server.DocumentLink(r.ctx, &protocol.DocumentLinkParams{
+	got, err := r.server.DocumentLink(r.ctx, &protocol.DocumentLinkParams{
 		TextDocument: protocol.TextDocumentIdentifier{
 			URI: protocol.NewURI(uri),
 		},
@@ -767,41 +808,8 @@ func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var notePositions []token.Position
-	links := make(map[span.Span]string, len(wantLinks))
-	for _, link := range wantLinks {
-		links[link.Src] = link.Target
-		notePositions = append(notePositions, link.NotePosition)
-	}
-
-	for _, link := range gotLinks {
-		spn, err := m.RangeSpan(link.Range)
-		if err != nil {
-			t.Fatal(err)
-		}
-		linkInNote := false
-		for _, notePosition := range notePositions {
-			// Drop the links found inside expectation notes arguments as this links are not collected by expect package
-			if notePosition.Line == spn.Start().Line() &&
-				notePosition.Column <= spn.Start().Column() {
-				delete(links, spn)
-				linkInNote = true
-			}
-		}
-		if linkInNote {
-			continue
-		}
-		if target, ok := links[spn]; ok {
-			delete(links, spn)
-			if target != link.Target {
-				t.Errorf("for %v want %v, got %v\n", spn, link.Target, target)
-			}
-		} else {
-			t.Errorf("unexpected link %v:%v\n", spn, link.Target)
-		}
-	}
-	for spn, target := range links {
-		t.Errorf("missing link %v:%v\n", spn, target)
+	if diff := tests.DiffLinks(m, wantLinks, got); diff != "" {
+		t.Error(diff)
 	}
 }
 

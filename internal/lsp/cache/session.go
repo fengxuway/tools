@@ -18,7 +18,6 @@ import (
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/telemetry"
 	"golang.org/x/tools/internal/span"
-	"golang.org/x/tools/internal/telemetry/log"
 	"golang.org/x/tools/internal/telemetry/trace"
 	"golang.org/x/tools/internal/xcontext"
 	errors "golang.org/x/xerrors"
@@ -79,7 +78,7 @@ func (s *session) Cache() source.Cache {
 	return s.cache
 }
 
-func (s *session) NewView(ctx context.Context, name string, folder span.URI, options source.Options) source.View {
+func (s *session) NewView(ctx context.Context, name string, folder span.URI, options source.Options) (source.View, error) {
 	index := atomic.AddInt64(&viewIndex, 1)
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
@@ -104,6 +103,7 @@ func (s *session) NewView(ctx context.Context, name string, folder span.URI, opt
 			metadata:   make(map[packageID]*metadata),
 			files:      make(map[span.URI]source.FileHandle),
 			importedBy: make(map[packageID][]packageID),
+			actions:    make(map[actionKey]*actionHandle),
 		},
 		ignoredURIs: make(map[span.URI]struct{}),
 		builtin:     &builtinPkg{},
@@ -118,11 +118,33 @@ func (s *session) NewView(ctx context.Context, name string, folder span.URI, opt
 	// so we immediately add builtin.go to the list of ignored files.
 	v.buildBuiltinPackage(ctx)
 
+	// Preemptively load everything in this directory.
+	// TODO(matloob): Determine if this can be done in parallel with something else.
+	// Perhaps different calls to NewView can be run in parallel?
+	// TODO(matloob): By default when a new file is opened, its data is invalidated
+	// and it's loaded again. Determine if the redundant reload can be avoided.
+	v.snapshotMu.Lock()
+	defer v.snapshotMu.Unlock() // The code after the snapshot is used isn't expensive.
+	m, err := v.snapshot.load(ctx, source.DirectoryURI(folder))
+	if err != nil && err != errNoPackagesFound {
+		return nil, err
+	}
+
+	// Prepare CheckPackageHandles for every package that's been loaded.
+	// (*snapshot).CheckPackageHandle makes the assumption that every package that's
+	// been loaded has an existing checkPackageHandle.
+	for _, m := range m {
+		_, err := v.snapshot.checkPackageHandle(ctx, m.id, source.ParseFull)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	s.views = append(s.views, v)
 	// we always need to drop the view map
 	s.viewMap = make(map[span.URI]source.View)
 	debug.AddView(debugView{v})
-	return v
+	return v, nil
 }
 
 // View returns the view by name.
@@ -216,7 +238,7 @@ func (s *session) removeView(ctx context.Context, view *view) error {
 }
 
 // TODO: Propagate the language ID through to the view.
-func (s *session) DidOpen(ctx context.Context, uri span.URI, kind source.FileKind, text []byte) {
+func (s *session) DidOpen(ctx context.Context, uri span.URI, kind source.FileKind, text []byte) error {
 	ctx = telemetry.File.With(ctx, uri)
 
 	// Files with _ prefixes are ignored.
@@ -226,7 +248,13 @@ func (s *session) DidOpen(ctx context.Context, uri span.URI, kind source.FileKin
 			view.ignoredURIs[uri] = struct{}{}
 			view.ignoredURIsMu.Unlock()
 		}
-		return
+		return nil
+	}
+
+	// Make sure that the file gets added to the session's file watch map.
+	view := s.bestView(uri)
+	if _, err := view.GetFile(ctx, uri); err != nil {
+		return err
 	}
 
 	// Mark the file as open.
@@ -235,15 +263,7 @@ func (s *session) DidOpen(ctx context.Context, uri span.URI, kind source.FileKin
 	// Read the file on disk and compare it to the text provided.
 	// If it is the same as on disk, we can avoid sending it as an overlay to go/packages.
 	s.openOverlay(ctx, uri, kind, text)
-
-	// Mark the file as just opened so that we know to re-run packages.Load on it.
-	// We do this because we may not be aware of all of the packages the file belongs to.
-	// A file may be in multiple views.
-	for _, view := range s.views {
-		if strings.HasPrefix(string(uri), string(view.Folder())) {
-			view.invalidateMetadata(ctx, uri)
-		}
-	}
+	return nil
 }
 
 func (s *session) DidSave(uri span.URI) {
@@ -276,7 +296,7 @@ func (s *session) SetOverlay(uri span.URI, kind source.FileKind, data []byte) bo
 	s.overlayMu.Lock()
 	defer func() {
 		s.overlayMu.Unlock()
-		s.filesWatchMap.Notify(uri)
+		s.filesWatchMap.Notify(uri, protocol.Changed)
 	}()
 
 	if data == nil {
@@ -298,13 +318,20 @@ func (s *session) SetOverlay(uri span.URI, kind source.FileKind, data []byte) bo
 	return firstChange
 }
 
+func (s *session) clearOverlay(uri span.URI) {
+	s.overlayMu.Lock()
+	defer s.overlayMu.Unlock()
+
+	delete(s.overlays, uri)
+}
+
 // openOverlay adds the file content to the overlay.
 // It also checks if the provided content is equivalent to the file's content on disk.
 func (s *session) openOverlay(ctx context.Context, uri span.URI, kind source.FileKind, data []byte) {
 	s.overlayMu.Lock()
 	defer func() {
 		s.overlayMu.Unlock()
-		s.filesWatchMap.Notify(uri)
+		s.filesWatchMap.Notify(uri, protocol.Created)
 	}()
 	s.overlays[uri] = &overlay{
 		session:   s,
@@ -314,13 +341,11 @@ func (s *session) openOverlay(ctx context.Context, uri span.URI, kind source.Fil
 		hash:      hashContents(data),
 		unchanged: true,
 	}
-	_, hash, err := s.cache.GetFile(uri, kind).Read(ctx)
-	if err != nil {
-		log.Error(ctx, "failed to read", err, telemetry.File)
-		return
-	}
-	if hash == s.overlays[uri].hash {
-		s.overlays[uri].sameContentOnDisk = true
+	// If the file is on disk, check if its content is the same as the overlay.
+	if _, hash, err := s.cache.GetFile(uri, kind).Read(ctx); err == nil {
+		if hash == s.overlays[uri].hash {
+			s.overlays[uri].sameContentOnDisk = true
+		}
 	}
 }
 
@@ -349,16 +374,8 @@ func (s *session) buildOverlay() map[string][]byte {
 	return overlays
 }
 
-func (s *session) DidChangeOutOfBand(ctx context.Context, uri span.URI, changeType protocol.FileChangeType) {
-	if changeType == protocol.Deleted {
-		// After a deletion we must invalidate the package's metadata to
-		// force a go/packages invocation to refresh the package's file list.
-		views := s.viewsOf(uri)
-		for _, v := range views {
-			v.invalidateMetadata(ctx, uri)
-		}
-	}
-	s.filesWatchMap.Notify(uri)
+func (s *session) DidChangeOutOfBand(ctx context.Context, uri span.URI, changeType protocol.FileChangeType) bool {
+	return s.filesWatchMap.Notify(uri, changeType)
 }
 
 func (o *overlay) FileSystem() source.FileSystem {
