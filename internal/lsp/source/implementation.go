@@ -11,84 +11,137 @@ package source
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"go/token"
 	"go/types"
-	"sort"
 
 	"golang.org/x/tools/go/types/typeutil"
 	"golang.org/x/tools/internal/lsp/protocol"
+	"golang.org/x/tools/internal/lsp/telemetry"
+	"golang.org/x/tools/internal/telemetry/log"
 )
 
-func Implementation(ctx context.Context, view View, f File, position protocol.Position) ([]protocol.Location, error) {
-	// Find all references to the identifier at the position.
-	ident, err := Identifier(ctx, view, f, position)
+func (i *IdentifierInfo) Implementation(ctx context.Context) ([]protocol.Location, error) {
+	ctx = telemetry.Package.With(ctx, i.pkg.ID())
+
+	res, err := i.implementations(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	res, err := ident.implementations(ctx)
-	if err != nil {
-		return nil, err
+	var objs []types.Object
+	pkgs := map[token.Pos]Package{}
+
+	if res.toMethod != nil {
+		// If we looked up a method, results are in toMethod.
+		for _, s := range res.toMethod {
+			if pkgs[s.Obj().Pos()] != nil {
+				continue
+			}
+			// Determine package of receiver.
+			recv := s.Recv()
+			if p, ok := recv.(*types.Pointer); ok {
+				recv = p.Elem()
+			}
+			if n, ok := recv.(*types.Named); ok {
+				pkg := res.pkgs[n]
+				pkgs[s.Obj().Pos()] = pkg
+			}
+			// Add object to objs.
+			objs = append(objs, s.Obj())
+		}
+	} else {
+		// Otherwise, the results are in to.
+		for _, t := range res.to {
+			// We'll provide implementations that are named types and pointers to named types.
+			if p, ok := t.(*types.Pointer); ok {
+				t = p.Elem()
+			}
+			if n, ok := t.(*types.Named); ok {
+				if pkgs[n.Obj().Pos()] != nil {
+					continue
+				}
+				pkg := res.pkgs[n]
+				pkgs[n.Obj().Pos()] = pkg
+				objs = append(objs, n.Obj())
+			}
+		}
 	}
 
 	var locations []protocol.Location
-	for _, t := range res.to {
-		// We'll provide implementations that are named types and pointers to named types.
-		if p, ok := t.(*types.Pointer); ok {
-			t = p.Elem()
+	for _, obj := range objs {
+		pkg := pkgs[obj.Pos()]
+		if pkgs[obj.Pos()] == nil || len(pkg.CompiledGoFiles()) == 0 {
+			continue
 		}
-		if n, ok := t.(*types.Named); ok {
-			ph, pkg, err := view.FindFileInPackage(ctx, f.URI(), ident.pkg)
-			if err != nil {
-				return nil, err
-			}
-			f, _, _, err := ph.Cached()
-			if err != nil {
-				return nil, err
-			}
-			ident, err := findIdentifier(ctx, view.Snapshot(), pkg, f, n.Obj().Pos())
-			if err != nil {
-				return nil, err
-			}
-			decRange, err := ident.Declaration.Range()
-			if err != nil {
-				return nil, err
-			}
-			locations = append(locations, protocol.Location{
-				URI:   protocol.NewURI(ident.Declaration.URI()),
-				Range: decRange,
-			})
+		file, _, err := i.Snapshot.View().FindPosInPackage(pkgs[obj.Pos()], obj.Pos())
+		if err != nil {
+			log.Error(ctx, "Error getting file for object", err)
+			continue
 		}
+		ident, err := findIdentifier(i.Snapshot, pkg, file, obj.Pos())
+		if err != nil {
+			log.Error(ctx, "Error getting ident for object", err)
+			continue
+		}
+		decRange, err := ident.Declaration.Range()
+		if err != nil {
+			log.Error(ctx, "Error getting range for object", err)
+			continue
+		}
+		// Do not add interface itself to the list.
+		if ident.Declaration.spanRange == i.Declaration.spanRange {
+			continue
+		}
+		locations = append(locations, protocol.Location{
+			URI:   protocol.NewURI(ident.Declaration.URI()),
+			Range: decRange,
+		})
 	}
-
 	return locations, nil
 }
 
 func (i *IdentifierInfo) implementations(ctx context.Context) (implementsResult, error) {
+	var T types.Type
+	var method *types.Func
 	if i.Type.Object == nil {
-		return implementsResult{}, errors.New("no type info object for identifier")
+		// This isn't a type. Is it a method?
+		obj, ok := i.Declaration.obj.(*types.Func)
+		if !ok {
+			return implementsResult{}, fmt.Errorf("no type info object for identifier %q", i.Name)
+		}
+		recv := obj.Type().(*types.Signature).Recv()
+		if recv == nil {
+			return implementsResult{}, fmt.Errorf("this function is not a method")
+		}
+		method = obj
+		T = recv.Type()
+	} else {
+		T = i.Type.Object.Type()
 	}
-	T := i.Type.Object.Type()
 
 	// Find all named types, even local types (which can have
 	// methods due to promotion) and the built-in "error".
 	// We ignore aliases 'type M = N' to avoid duplicate
 	// reporting of the Named type N.
 	var allNamed []*types.Named
-	info := i.pkg.GetTypesInfo()
-	for _, obj := range info.Defs {
-		if obj, ok := obj.(*types.TypeName); ok && !obj.IsAlias() {
-			if named, ok := obj.Type().(*types.Named); ok {
-				allNamed = append(allNamed, named)
+	pkgs := map[*types.Named]Package{}
+	for _, pkg := range i.Snapshot.KnownPackages(ctx) {
+		info := pkg.GetTypesInfo()
+		for _, obj := range info.Defs {
+			if obj, ok := obj.(*types.TypeName); ok && !obj.IsAlias() {
+				if named, ok := obj.Type().(*types.Named); ok {
+					allNamed = append(allNamed, named)
+					pkgs[named] = pkg
+				}
 			}
 		}
 	}
-
 	allNamed = append(allNamed, types.Universe.Lookup("error").Type().(*types.Named))
 
 	var msets typeutil.MethodSetCache
 
-	// TODO(matloob): We only use the to result for now. Figure out if we want to
+	// TODO(matloob): We only use the to and toMethod result for now. Figure out if we want to
 	// surface the from and fromPtr results to users.
 	// Test each named type.
 	var to, from, fromPtr []types.Type
@@ -132,27 +185,21 @@ func (i *IdentifierInfo) implementations(ctx context.Context) (implementsResult,
 			}
 		}
 	}
-
-	// Sort types (arbitrarily) to ensure test determinism.
-	sort.Sort(typesByString(to))
-	sort.Sort(typesByString(from))
-	sort.Sort(typesByString(fromPtr))
-
-	// TODO(matloob): Perhaps support calling implements on methods instead of just interface types,
-	// as guru does.
-
-	return implementsResult{to, from, fromPtr}, nil
+	var toMethod []*types.Selection // contain nils
+	if method != nil {
+		for _, t := range to {
+			toMethod = append(toMethod,
+				types.NewMethodSet(t).Lookup(method.Pkg(), method.Name()))
+		}
+	}
+	return implementsResult{pkgs, to, from, fromPtr, toMethod}, nil
 }
 
 // implementsResult contains the results of an implements query.
 type implementsResult struct {
-	to      []types.Type // named or ptr-to-named types assignable to interface T
-	from    []types.Type // named interfaces assignable from T
-	fromPtr []types.Type // named interfaces assignable only from *T
+	pkgs     map[*types.Named]Package
+	to       []types.Type // named or ptr-to-named types assignable to interface T
+	from     []types.Type // named interfaces assignable from T
+	fromPtr  []types.Type // named interfaces assignable only from *T
+	toMethod []*types.Selection
 }
-
-type typesByString []types.Type
-
-func (p typesByString) Len() int           { return len(p) }
-func (p typesByString) Less(i, j int) bool { return p[i].String() < p[j].String() }
-func (p typesByString) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }

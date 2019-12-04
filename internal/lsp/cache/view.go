@@ -12,6 +12,7 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -103,8 +104,26 @@ func (v *view) Options() source.Options {
 	return v.options
 }
 
-func (v *view) SetOptions(options source.Options) {
-	v.options = options
+func minorOptionsChange(a, b source.Options) bool {
+	// Check if any of the settings that modify our understanding of files have been changed
+	if !reflect.DeepEqual(a.Env, b.Env) {
+		return false
+	}
+	if !reflect.DeepEqual(a.BuildFlags, b.BuildFlags) {
+		return false
+	}
+	// the rest of the options are benign
+	return true
+}
+
+func (v *view) SetOptions(ctx context.Context, options source.Options) (source.View, error) {
+	// no need to rebuild the view if the options were not materially changed
+	if minorOptionsChange(v.options, options) {
+		v.options = options
+		return v, nil
+	}
+	newView, _, err := v.session.updateView(ctx, v, options)
+	return newView, err
 }
 
 // Config returns the configuration used for the view's interaction with the
@@ -254,8 +273,8 @@ func (v *view) storeModFileVersions() {
 
 func (v *view) fileVersion(filename string, kind source.FileKind) string {
 	uri := span.FileURI(filename)
-	f := v.session.GetFile(uri, kind)
-	return f.Identity().Version
+	fh := v.session.GetFile(uri, kind)
+	return fh.Identity().String()
 }
 
 func (v *view) Shutdown(ctx context.Context) {
@@ -282,16 +301,6 @@ func (v *view) Ignore(uri span.URI) bool {
 	return ok
 }
 
-func (v *view) findIgnoredFile(ctx context.Context, uri span.URI) (source.ParseGoHandle, source.Package, error) {
-	// Check the builtin package.
-	for _, h := range v.BuiltinPackage().Files() {
-		if h.File().Identity().URI == uri {
-			return h, nil, nil
-		}
-	}
-	return nil, nil, errors.Errorf("no ignored file for %s", uri)
-}
-
 func (v *view) BackgroundContext() context.Context {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -315,21 +324,21 @@ func (v *view) getSnapshot() *snapshot {
 }
 
 // SetContent sets the overlay contents for a file.
-func (v *view) SetContent(ctx context.Context, uri span.URI, content []byte) (bool, error) {
+func (v *view) SetContent(ctx context.Context, uri span.URI, version float64, content []byte) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+
+	if v.Ignore(uri) {
+		return
+	}
 
 	// Cancel all still-running previous requests, since they would be
 	// operating on stale data.
 	v.cancel()
 	v.backgroundCtx, v.cancel = context.WithCancel(v.baseCtx)
 
-	if v.Ignore(uri) {
-		return false, nil
-	}
-
 	kind := source.DetectLanguage("", uri.Filename())
-	return v.session.SetOverlay(uri, kind, content), nil
+	v.session.SetOverlay(uri, kind, version, content)
 }
 
 // FindFile returns the file if the given URI is already a part of the view.
@@ -365,11 +374,11 @@ func (v *view) getFile(ctx context.Context, uri span.URI, kind source.FileKind) 
 	f = &fileBase{
 		view:  v,
 		fname: uri.Filename(),
-		kind:  source.Go,
+		kind:  kind,
 	}
-	v.session.filesWatchMap.Watch(uri, func(changeType protocol.FileChangeType) bool {
+	v.session.filesWatchMap.Watch(uri, func(action source.FileAction) bool {
 		ctx := xcontext.Detach(ctx)
-		return v.invalidateContent(ctx, f, kind, changeType)
+		return v.invalidateContent(ctx, f, kind, action)
 	})
 	v.mapFile(uri, f)
 	return f, nil
@@ -423,25 +432,87 @@ func (v *view) mapFile(uri span.URI, f viewFile) {
 	}
 }
 
-func (v *view) openFiles(ctx context.Context, uris []span.URI) (results []source.File) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	for _, uri := range uris {
-		// Call unlocked version of getFile since we hold the lock on the view.
-		if f, err := v.getFile(ctx, uri, source.Go); err == nil && v.session.IsOpen(uri) {
-			results = append(results, f)
-		}
+func (v *view) FindPosInPackage(searchpkg source.Package, pos token.Pos) (*ast.File, source.Package, error) {
+	tok := v.session.cache.fset.File(pos)
+	if tok == nil {
+		return nil, nil, errors.Errorf("no file for pos in package %s", searchpkg.ID())
 	}
-	return results
+	uri := span.FileURI(tok.Name())
+
+	// Special case for ignored files.
+	var (
+		ph  source.ParseGoHandle
+		pkg source.Package
+		err error
+	)
+	if v.Ignore(uri) {
+		ph, pkg, err = v.findIgnoredFile(uri)
+	} else {
+		ph, pkg, err = findFileInPackage(searchpkg, uri)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	file, _, _, err := ph.Cached()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !(file.Pos() <= pos && pos <= file.End()) {
+		return nil, nil, fmt.Errorf("pos %v, apparently in file %q, is not between %v and %v", pos, ph.File().Identity().URI, file.Pos(), file.End())
+	}
+	return file, pkg, nil
 }
 
-func (v *view) FindFileInPackage(ctx context.Context, uri span.URI, pkg source.Package) (source.ParseGoHandle, source.Package, error) {
+func (v *view) FindMapperInPackage(searchpkg source.Package, uri span.URI) (*protocol.ColumnMapper, error) {
 	// Special case for ignored files.
+	var (
+		ph  source.ParseGoHandle
+		err error
+	)
 	if v.Ignore(uri) {
-		return v.findIgnoredFile(ctx, uri)
+		ph, _, err = v.findIgnoredFile(uri)
+	} else {
+		ph, _, err = findFileInPackage(searchpkg, uri)
 	}
-	return findFileInPackage(ctx, uri, pkg)
+	if err != nil {
+		return nil, err
+	}
+	_, m, _, err := ph.Cached()
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (v *view) findIgnoredFile(uri span.URI) (source.ParseGoHandle, source.Package, error) {
+	// Check the builtin package.
+	for _, h := range v.BuiltinPackage().CompiledGoFiles() {
+		if h.File().Identity().URI == uri {
+			return h, nil, nil
+		}
+	}
+	return nil, nil, errors.Errorf("no ignored file for %s", uri)
+}
+
+func findFileInPackage(pkg source.Package, uri span.URI) (source.ParseGoHandle, source.Package, error) {
+	queue := []source.Package{pkg}
+	seen := make(map[string]bool)
+
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+		seen[pkg.ID()] = true
+
+		if f, err := pkg.File(uri); err == nil {
+			return f, pkg, nil
+		}
+		for _, dep := range pkg.Imports() {
+			if !seen[dep.ID()] {
+				queue = append(queue, dep)
+			}
+		}
+	}
+	return nil, nil, errors.Errorf("no file for %s in package %s", uri, pkg.ID())
 }
 
 type debugView struct{ *view }
