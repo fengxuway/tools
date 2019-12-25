@@ -136,7 +136,11 @@ func (s *snapshot) buildKey(ctx context.Context, id packageID, mode source.Parse
 	// Begin computing the key by getting the depKeys for all dependencies.
 	var depKeys [][]byte
 	for _, depID := range depList {
-		depHandle, err := s.packageHandle(ctx, depID, source.ParseExported)
+		mode := source.ParseExported
+		if s.workspacePackages[depID] {
+			mode = source.ParseFull
+		}
+		depHandle, err := s.packageHandle(ctx, depID, mode)
 		if err != nil {
 			log.Error(ctx, "no dep handle", err, telemetry.Package.Of(depID))
 
@@ -180,7 +184,7 @@ func (ph *packageHandle) Check(ctx context.Context) (source.Package, error) {
 func (ph *packageHandle) check(ctx context.Context) (*pkg, error) {
 	v := ph.handle.Get(ctx)
 	if v == nil {
-		return nil, errors.Errorf("no package for %s", ph.m.id)
+		return nil, ctx.Err()
 	}
 	data := v.(*packageData)
 	return data.pkg, data.err
@@ -218,11 +222,10 @@ func (ph *packageHandle) cached() (*pkg, error) {
 func (s *snapshot) parseGoHandles(ctx context.Context, files []span.URI, mode source.ParseMode) ([]source.ParseGoHandle, error) {
 	phs := make([]source.ParseGoHandle, 0, len(files))
 	for _, uri := range files {
-		f, err := s.view.GetFile(ctx, uri)
+		fh, err := s.GetFile(ctx, uri)
 		if err != nil {
 			return nil, err
 		}
-		fh := s.Handle(ctx, f)
 		phs = append(phs, s.view.session.cache.ParseGoHandle(fh, mode))
 	}
 	return phs, nil
@@ -338,7 +341,6 @@ func typeCheck(ctx context.Context, fset *token.FileSet, m *metadata, mode sourc
 			pkg.errors = append(pkg.errors, srcErr)
 		}
 	}
-
 	return pkg, nil
 }
 

@@ -57,11 +57,24 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 		t.Fatal(err)
 	}
 	for filename, content := range data.Config.Overlay {
-		session.SetOverlay(span.FileURI(filename), source.DetectLanguage("", filename), -1, content)
+		kind := source.DetectLanguage("", filename)
+		if kind != source.Go {
+			continue
+		}
+		if _, err := session.DidModifyFile(ctx, source.FileModification{
+			URI:        span.FileURI(filename),
+			Action:     source.Open,
+			Version:    -1,
+			Text:       content,
+			LanguageID: "go",
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	r := &runner{
 		server: &Server{
-			session: session,
+			session:   session,
+			delivered: map[span.URI]sentDiagnostics{},
 		},
 		data: data,
 		ctx:  ctx,
@@ -73,12 +86,12 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 // TODO: Actually test the LSP diagnostics function in this test.
 func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []source.Diagnostic) {
 	v := r.server.session.View(viewName)
-	f, err := v.GetFile(r.ctx, uri)
+	fh, err := v.Snapshot().GetFile(r.ctx, uri)
 	if err != nil {
-		t.Fatalf("no file for %s: %v", f, err)
+		t.Fatal(err)
 	}
-	identity := v.Snapshot().Handle(r.ctx, f).Identity()
-	results, _, err := source.Diagnostics(r.ctx, v.Snapshot(), f, true, nil)
+	identity := fh.Identity()
+	results, _, err := source.Diagnostics(r.ctx, v.Snapshot(), fh, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,22 +304,13 @@ func (r *runner) Format(t *testing.T, spn span.Span) {
 func (r *runner) Import(t *testing.T, spn span.Span) {
 	uri := spn.URI()
 	filename := uri.Filename()
-	goimported := string(r.data.Golden("goimports", filename, func() ([]byte, error) {
-		cmd := exec.Command("goimports", filename)
-		out, _ := cmd.Output() // ignore error, sometimes we have intentionally ungofmt-able files
-		return out, nil
-	}))
-
 	actions, err := r.server.CodeAction(r.ctx, &protocol.CodeActionParams{
 		TextDocument: protocol.TextDocumentIdentifier{
 			URI: protocol.NewURI(uri),
 		},
 	})
 	if err != nil {
-		if goimported != "" {
-			t.Error(err)
-		}
-		return
+		t.Fatal(err)
 	}
 	m, err := r.data.Mapper(uri)
 	if err != nil {
@@ -320,8 +324,11 @@ func (r *runner) Import(t *testing.T, spn span.Span) {
 		}
 		got = res[uri]
 	}
-	if goimported != got {
-		t.Errorf("import failed for %s, expected:\n%v\ngot:\n%v", filename, goimported, got)
+	want := string(r.data.Golden("goimports", filename, func() ([]byte, error) {
+		return []byte(got), nil
+	}))
+	if want != got {
+		t.Errorf("import failed for %s, expected:\n%v\ngot:\n%v", filename, want, got)
 	}
 }
 
@@ -332,13 +339,13 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := view.GetFile(r.ctx, uri)
+	snapshot := view.Snapshot()
+	fh, err := snapshot.GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := view.Snapshot()
-	fileID := snapshot.Handle(r.ctx, f).Identity()
-	diagnostics, _, err := source.Diagnostics(r.ctx, snapshot, f, true, nil)
+	fileID := fh.Identity()
+	diagnostics, _, err := source.Diagnostics(r.ctx, snapshot, fh, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,14 +449,14 @@ func (r *runner) Definition(t *testing.T, spn span.Span, d tests.Definition) {
 	}
 }
 
-func (r *runner) Implementation(t *testing.T, spn span.Span, m tests.Implementations) {
-	sm, err := r.data.Mapper(m.Src.URI())
+func (r *runner) Implementation(t *testing.T, spn span.Span, impls []span.Span) {
+	sm, err := r.data.Mapper(spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	loc, err := sm.Location(m.Src)
+	loc, err := sm.Location(spn)
 	if err != nil {
-		t.Fatalf("failed for %v: %v", m.Src, err)
+		t.Fatalf("failed for %v: %v", spn, err)
 	}
 	tdpp := protocol.TextDocumentPositionParams{
 		TextDocument: protocol.TextDocumentIdentifier{URI: loc.URI},
@@ -461,10 +468,10 @@ func (r *runner) Implementation(t *testing.T, spn span.Span, m tests.Implementat
 	}
 	locs, err = r.server.Implementation(r.ctx, params)
 	if err != nil {
-		t.Fatalf("failed for %v: %v", m.Src, err)
+		t.Fatalf("failed for %v: %v", spn, err)
 	}
-	if len(locs) != len(m.Implementations) {
-		t.Fatalf("got %d locations for implementation, expected %d", len(locs), len(m.Implementations))
+	if len(locs) != len(impls) {
+		t.Fatalf("got %d locations for implementation, expected %d", len(locs), len(impls))
 	}
 
 	var results []span.Span
@@ -484,12 +491,12 @@ func (r *runner) Implementation(t *testing.T, spn span.Span, m tests.Implementat
 	sort.SliceStable(results, func(i, j int) bool {
 		return span.Compare(results[i], results[j]) == -1
 	})
-	sort.SliceStable(m.Implementations, func(i, j int) bool {
-		return span.Compare(m.Implementations[i], m.Implementations[j]) == -1
+	sort.SliceStable(impls, func(i, j int) bool {
+		return span.Compare(impls[i], impls[j]) == -1
 	})
 	for i := range results {
-		if results[i] != m.Implementations[i] {
-			t.Errorf("for %dth implementation of %v got %v want %v", i, m.Src, results[i], m.Implementations[i])
+		if results[i] != impls[i] {
+			t.Errorf("for %dth implementation of %v got %v want %v", i, spn, results[i], impls[i])
 		}
 	}
 }
@@ -547,7 +554,6 @@ func (r *runner) References(t *testing.T, src span.Span, itemList []span.Span) {
 	if err != nil {
 		t.Fatalf("failed for %v: %v", src, err)
 	}
-
 	want := make(map[protocol.Location]bool)
 	for _, pos := range itemList {
 		m, err := r.data.Mapper(pos.URI())
@@ -564,6 +570,9 @@ func (r *runner) References(t *testing.T, src span.Span, itemList []span.Span) {
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
 			TextDocument: protocol.TextDocumentIdentifier{URI: loc.URI},
 			Position:     loc.Range.Start,
+		},
+		Context: protocol.ReferenceContext{
+			IncludeDeclaration: true,
 		},
 	}
 	got, err := r.server.References(r.ctx, params)

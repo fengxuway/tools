@@ -62,7 +62,7 @@ func (s *snapshot) load(ctx context.Context, scope source.Scope) ([]*metadata, e
 	if err == context.Canceled {
 		return nil, errors.Errorf("no metadata for %s: %v", uri, err)
 	}
-	log.Print(ctx, "go/packages.Load", tag.Of("packages", len(pkgs)))
+	log.Print(ctx, "go/packages.Load", tag.Of("query", query), tag.Of("packages", len(pkgs)))
 	if len(pkgs) == 0 {
 		if err == nil {
 			err = errors.Errorf("no packages found for query %s", query)
@@ -78,6 +78,10 @@ func (s *snapshot) load(ctx context.Context, scope source.Scope) ([]*metadata, e
 // determine if they have changed.
 func (c *cache) shouldLoad(ctx context.Context, s *snapshot, originalFH, currentFH source.FileHandle) bool {
 	if originalFH == nil {
+		return true
+	}
+	// If the file is a mod file, we should always load.
+	if originalFH.Identity().Kind == currentFH.Identity().Kind && currentFH.Identity().Kind == source.Mod {
 		return true
 	}
 
@@ -96,13 +100,17 @@ func (c *cache) shouldLoad(ctx context.Context, s *snapshot, originalFH, current
 	if original.Name.Name != current.Name.Name {
 		return true
 	}
-	// If the package's imports have changed, re-run `go list`.
-	if len(original.Imports) != len(current.Imports) {
+	// If the package's imports have increased, definitely re-run `go list`.
+	if len(original.Imports) < len(current.Imports) {
 		return true
 	}
-	for i, importSpec := range original.Imports {
-		// TODO: Handle the case where the imports have just been re-ordered.
-		if importSpec.Path.Value != current.Imports[i].Path.Value {
+	importSet := make(map[string]struct{})
+	for _, importSpec := range original.Imports {
+		importSet[importSpec.Path.Value] = struct{}{}
+	}
+	// If any of the current imports were not in the original imports.
+	for _, importSpec := range current.Imports {
+		if _, ok := importSet[importSpec.Path.Value]; !ok {
 			return true
 		}
 	}
@@ -110,24 +118,11 @@ func (c *cache) shouldLoad(ctx context.Context, s *snapshot, originalFH, current
 }
 
 func (s *snapshot) updateMetadata(ctx context.Context, uri source.Scope, pkgs []*packages.Package, cfg *packages.Config) ([]*metadata, error) {
-	// Clear metadata since we are re-running go/packages.
-	var m []*metadata
-	switch uri.(type) {
-	case source.FileURI:
-		m = s.getMetadataForURI(uri.URI())
-	case source.DirectoryURI:
-		for _, pkg := range pkgs {
-			if pkgMetadata := s.getMetadata(packageID(pkg.ID)); pkgMetadata != nil {
-				m = append(m, pkgMetadata)
-			}
-		}
-	default:
-		panic(fmt.Errorf("unsupported Scope type %T", uri))
-	}
-
 	var results []*metadata
 	for _, pkg := range pkgs {
-		log.Print(ctx, "go/packages.Load", tag.Of("package", pkg.PkgPath), tag.Of("files", pkg.CompiledGoFiles))
+		if _, isDir := uri.(source.DirectoryURI); !isDir || s.view.Options().VerboseOutput {
+			log.Print(ctx, "go/packages.Load", tag.Of("package", pkg.PkgPath), tag.Of("files", pkg.CompiledGoFiles))
+		}
 
 		// Set the metadata for this package.
 		if err := s.updateImports(ctx, packagePath(pkg.PkgPath), pkg, cfg, map[packageID]struct{}{}); err != nil {

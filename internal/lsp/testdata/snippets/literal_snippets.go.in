@@ -125,7 +125,7 @@ func _() {
 func _() {
 	_ = "func(...) {}" //@item(litFunc, "func(...) {}", "", "var")
 
-	sort.Slice(nil, f) //@snippet(")", litFunc, "func(i, j int) bool {$0\\}", "func(i, j int) bool {$0\\}")
+	sort.Slice(nil, fun) //@complete(")", litFunc),snippet(")", litFunc, "func(i, j int) bool {$0\\}", "func(i, j int) bool {$0\\}")
 
 	http.HandleFunc("", f) //@snippet(")", litFunc, "", "func(${1:rw} http.ResponseWriter, ${2:r} *http.Request) {$0\\}")
 
@@ -159,4 +159,17 @@ func _() {
 	var sf foo.StructFoo
 	sf = foo.Str //@snippet(" //", litStructFoo, "StructFoo{$0\\}", "StructFoo{$0\\}")
 	sf = foo. //@snippet(" //", litStructFoo, "StructFoo{$0\\}", "StructFoo{$0\\}")
+}
+
+func _() {
+	float64() //@item(litFloat64, "float64()", "float64", "var")
+
+	var f float64
+	f = fl //@complete(" //", litFloat64),snippet(" //", litFloat64, "float64($0)", "float64($0)")
+
+	type myInt int
+	myInt() //@item(litMyInt, "myInt()", "", "var")
+
+	var mi myInt
+	mi = my //@snippet(" //", litMyInt, "myInt($0)", "myInt($0)")
 }

@@ -12,66 +12,54 @@ import (
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
-	"golang.org/x/tools/internal/lsp/telemetry"
 	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
 )
 
 func (s *Server) didOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
-	uri := span.NewURI(params.TextDocument.URI)
-	text := []byte(params.TextDocument.Text)
-	version := params.TextDocument.Version
-
 	// Confirm that the file's language ID is related to Go.
-	fileKind := source.DetectLanguage(params.TextDocument.LanguageID, uri.Filename())
-
-	// Open the file.
-	s.session.DidOpen(ctx, uri, fileKind, version, text)
-
-	view, err := s.session.ViewOf(uri)
+	uri := span.NewURI(params.TextDocument.URI)
+	snapshots, err := s.session.DidModifyFile(ctx, source.FileModification{
+		URI:        uri,
+		Action:     source.Open,
+		Version:    params.TextDocument.Version,
+		Text:       []byte(params.TextDocument.Text),
+		LanguageID: params.TextDocument.LanguageID,
+	})
 	if err != nil {
 		return err
 	}
-	snapshot := view.Snapshot()
-
-	// Run diagnostics on the newly-opened file.
-	go s.diagnoseFile(snapshot, uri)
-
-	return nil
+	snapshot, _, err := snapshotOf(s.session, uri, snapshots)
+	if err != nil {
+		return err
+	}
+	fh, err := snapshot.GetFile(ctx, uri)
+	if err != nil {
+		return err
+	}
+	// Always run diagnostics when a file is opened.
+	return s.diagnose(snapshot, fh)
 }
 
 func (s *Server) didChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
-	options := s.session.Options()
-	if len(params.ContentChanges) < 1 {
-		return jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "no content changes provided")
-	}
-
 	uri := span.NewURI(params.TextDocument.URI)
-
-	// Check if the client sent the full content of the file.
-	// We accept a full content change even if the server expected incremental changes.
-	text, isFullChange := fullChange(params.ContentChanges)
-
-	// We only accept an incremental change if the server expected it.
-	if !isFullChange {
-		switch options.TextDocumentSyncKind {
-		case protocol.Full:
-			return errors.Errorf("expected a full content change, received incremental changes for %s", uri)
-		case protocol.Incremental:
-			// Determine the new file content.
-			var err error
-			text, err = s.applyChanges(ctx, uri, params.ContentChanges)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	// Cache the new file content and send fresh diagnostics.
-	view, err := s.session.ViewOf(uri)
+	text, err := s.changedText(ctx, uri, params.ContentChanges)
 	if err != nil {
 		return err
 	}
-	view.SetContent(ctx, uri, params.TextDocument.Version, []byte(text))
+	snapshots, err := s.session.DidModifyFile(ctx, source.FileModification{
+		URI:     uri,
+		Action:  source.Change,
+		Version: params.TextDocument.Version,
+		Text:    text,
+	})
+	if err != nil {
+		return err
+	}
+	snapshot, view, err := snapshotOf(s.session, uri, snapshots)
+	if err != nil {
+		return err
+	}
 	// Ideally, we should be able to specify that a generated file should be opened as read-only.
 	// Tell the user that they should not be editing a generated file.
 	if s.wasFirstChange(uri) && source.IsGenerated(ctx, view, uri) {
@@ -80,10 +68,49 @@ func (s *Server) didChange(ctx context.Context, params *protocol.DidChangeTextDo
 			Type:    protocol.Warning,
 		})
 	}
-	// Run diagnostics on the newly-changed file.
-	go s.diagnoseFile(view.Snapshot(), uri)
+	fh, err := snapshot.GetFile(ctx, uri)
+	if err != nil {
+		return err
+	}
+	// Always update diagnostics after a file change.
+	return s.diagnose(snapshot, fh)
+}
 
-	return nil
+func (s *Server) didSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
+	c := source.FileModification{
+		URI:     span.NewURI(params.TextDocument.URI),
+		Action:  source.Save,
+		Version: params.TextDocument.Version,
+	}
+	if params.Text != nil {
+		c.Text = []byte(*params.Text)
+	}
+	_, err := s.session.DidModifyFile(ctx, c)
+	return err
+}
+
+func (s *Server) didClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
+	_, err := s.session.DidModifyFile(ctx, source.FileModification{
+		URI:     span.NewURI(params.TextDocument.URI),
+		Action:  source.Close,
+		Version: -1,
+		Text:    nil,
+	})
+	return err
+}
+
+// snapshotOf returns the snapshot corresponding to the view for the given file URI.
+func snapshotOf(session source.Session, uri span.URI, snapshots []source.Snapshot) (source.Snapshot, source.View, error) {
+	view, err := session.ViewOf(uri)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, s := range snapshots {
+		if s.View() == view {
+			return s, view, nil
+		}
+	}
+	return nil, nil, errors.Errorf("bestSnapshot: no snapshot for %s", uri)
 }
 
 func (s *Server) wasFirstChange(uri span.URI) bool {
@@ -94,43 +121,51 @@ func (s *Server) wasFirstChange(uri span.URI) bool {
 	return ok
 }
 
-func fullChange(changes []protocol.TextDocumentContentChangeEvent) (string, bool) {
-	if len(changes) > 1 {
-		return "", false
-	}
-	// The length of the changes must be 1 at this point.
-	// TODO: This breaks if you insert a character at the beginning of the file.
-	if changes[0].Range == nil && changes[0].RangeLength == 0 {
-		return changes[0].Text, true
+func (s *Server) changedText(ctx context.Context, uri span.URI, changes []protocol.TextDocumentContentChangeEvent) ([]byte, error) {
+	if len(changes) == 0 {
+		return nil, jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "no content changes provided")
 	}
 
-	return "", false
+	// Check if the client sent the full content of the file.
+	// We accept a full content change even if the server expected incremental changes.
+	if len(changes) == 1 && changes[0].Range == nil && changes[0].RangeLength == 0 {
+		return []byte(changes[0].Text), nil
+	}
+
+	// We only accept an incremental change if that's what the server expects.
+	if s.session.Options().TextDocumentSyncKind == protocol.Full {
+		return nil, errors.Errorf("expected a full content change, received incremental changes for %s", uri)
+	}
+
+	return s.applyIncrementalChanges(ctx, uri, changes)
 }
 
-func (s *Server) applyChanges(ctx context.Context, uri span.URI, changes []protocol.TextDocumentContentChangeEvent) (string, error) {
+func (s *Server) applyIncrementalChanges(ctx context.Context, uri span.URI, changes []protocol.TextDocumentContentChangeEvent) ([]byte, error) {
 	content, _, err := s.session.GetFile(uri, source.UnknownKind).Read(ctx)
 	if err != nil {
-		return "", jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "file not found (%v)", err)
+		return nil, jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "file not found (%v)", err)
 	}
 	for _, change := range changes {
-		// Update column mapper along with the content.
+		// Make sure to update column mapper along with the content.
 		converter := span.NewContentConverter(uri.Filename(), content)
 		m := &protocol.ColumnMapper{
 			URI:       uri,
 			Converter: converter,
 			Content:   content,
 		}
-
-		spn, err := m.RangeSpan(*change.Range) // Could Range be nil here?
+		if change.Range == nil {
+			return nil, jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "unexpected nil range for change")
+		}
+		spn, err := m.RangeSpan(*change.Range)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		if !spn.HasOffset() {
-			return "", jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "invalid range for content change")
+			return nil, jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "invalid range for content change")
 		}
 		start, end := spn.Start().Offset(), spn.End().Offset()
 		if end < start {
-			return "", jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "invalid range for content change")
+			return nil, jsonrpc2.NewErrorf(jsonrpc2.CodeInternalError, "invalid range for content change")
 		}
 		var buf bytes.Buffer
 		buf.Write(content[:start])
@@ -138,22 +173,5 @@ func (s *Server) applyChanges(ctx context.Context, uri span.URI, changes []proto
 		buf.Write(content[end:])
 		content = buf.Bytes()
 	}
-	return string(content), nil
-}
-
-func (s *Server) didSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
-	s.session.DidSave(span.NewURI(params.TextDocument.URI), params.TextDocument.Version)
-	return nil
-}
-
-func (s *Server) didClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
-	uri := span.NewURI(params.TextDocument.URI)
-	ctx = telemetry.URI.With(ctx, uri)
-	s.session.DidClose(uri)
-	view, err := s.session.ViewOf(uri)
-	if err != nil {
-		return err
-	}
-	view.SetContent(ctx, uri, -1, nil)
-	return nil
+	return content, nil
 }

@@ -5,7 +5,6 @@
 package source
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"go/ast"
@@ -14,6 +13,7 @@ import (
 	"go/types"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"golang.org/x/tools/internal/lsp/protocol"
@@ -65,6 +65,27 @@ func (s mappedRange) URI() span.URI {
 	return s.m.URI
 }
 
+// getParsedFile is a convenience function that extracts the Package and ParseGoHandle for a File in a Snapshot.
+// selectPackage is typically Narrowest/WidestCheckPackageHandle below.
+func getParsedFile(ctx context.Context, snapshot Snapshot, fh FileHandle, selectPackage PackagePolicy) (Package, ParseGoHandle, error) {
+	phs, err := snapshot.PackageHandles(ctx, fh)
+	if err != nil {
+		return nil, nil, err
+	}
+	ph, err := selectPackage(phs)
+	if err != nil {
+		return nil, nil, err
+	}
+	pkg, err := ph.Check(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	pgh, err := pkg.File(fh.Identity().URI)
+	return pkg, pgh, err
+}
+
+type PackagePolicy func([]PackageHandle) (PackageHandle, error)
+
 // NarrowestCheckPackageHandle picks the "narrowest" package for a given file.
 //
 // By "narrowest" package, we mean the package with the fewest number of files
@@ -106,12 +127,26 @@ func WidestCheckPackageHandle(handles []PackageHandle) (PackageHandle, error) {
 	return result, nil
 }
 
+// SpecificPackageHandle creates a PackagePolicy to select a
+// particular PackageHandle when you alread know the one you want.
+func SpecificPackageHandle(desiredID string) PackagePolicy {
+	return func(handles []PackageHandle) (PackageHandle, error) {
+		for _, h := range handles {
+			if h.ID() == desiredID {
+				return h, nil
+			}
+		}
+
+		return nil, fmt.Errorf("no package handle with expected id %q", desiredID)
+	}
+}
+
 func IsGenerated(ctx context.Context, view View, uri span.URI) bool {
-	f, err := view.GetFile(ctx, uri)
+	fh, err := view.Snapshot().GetFile(ctx, uri)
 	if err != nil {
 		return false
 	}
-	ph := view.Session().Cache().ParseGoHandle(view.Snapshot().Handle(ctx, f), ParseHeader)
+	ph := view.Session().Cache().ParseGoHandle(fh, ParseHeader)
 	parsed, _, _, err := ph.Parse(ctx)
 	if err != nil {
 		return false
@@ -284,24 +319,42 @@ func fieldSelections(T types.Type) (fields []*types.Var) {
 	return fields
 }
 
+// typeIsValid reports whether typ doesn't contain any Invalid types.
+func typeIsValid(typ types.Type) bool {
+	switch typ := typ.Underlying().(type) {
+	case *types.Basic:
+		return typ.Kind() != types.Invalid
+	case *types.Array:
+		return typeIsValid(typ.Elem())
+	case *types.Slice:
+		return typeIsValid(typ.Elem())
+	case *types.Pointer:
+		return typeIsValid(typ.Elem())
+	case *types.Map:
+		return typeIsValid(typ.Key()) && typeIsValid(typ.Elem())
+	case *types.Chan:
+		return typeIsValid(typ.Elem())
+	case *types.Signature:
+		return typeIsValid(typ.Params()) && typeIsValid(typ.Results())
+	case *types.Tuple:
+		for i := 0; i < typ.Len(); i++ {
+			if !typeIsValid(typ.At(i).Type()) {
+				return false
+			}
+		}
+		return true
+	case *types.Struct, *types.Interface, *types.Named:
+		// Don't bother checking structs, interfaces, or named types for validity.
+		return true
+	default:
+		return false
+	}
+}
+
 // resolveInvalid traverses the node of the AST that defines the scope
 // containing the declaration of obj, and attempts to find a user-friendly
 // name for its invalid type. The resulting Object and its Type are fake.
-func resolveInvalid(obj types.Object, node ast.Node, info *types.Info) types.Object {
-	// Construct a fake type for the object and return a fake object with this type.
-	formatResult := func(expr ast.Expr) types.Object {
-		var typename string
-		switch t := expr.(type) {
-		case *ast.SelectorExpr:
-			typename = fmt.Sprintf("%s.%s", t.X, t.Sel)
-		case *ast.Ident:
-			typename = t.String()
-		default:
-			return nil
-		}
-		typ := types.NewNamed(types.NewTypeName(token.NoPos, obj.Pkg(), typename, nil), types.Typ[types.Invalid], nil)
-		return types.NewVar(obj.Pos(), obj.Pkg(), obj.Name(), typ)
-	}
+func resolveInvalid(fset *token.FileSet, obj types.Object, node ast.Node, info *types.Info) types.Object {
 	var resultExpr ast.Expr
 	ast.Inspect(node, func(node ast.Node) bool {
 		switch n := node.(type) {
@@ -319,12 +372,14 @@ func resolveInvalid(obj types.Object, node ast.Node, info *types.Info) types.Obj
 				}
 			}
 			return false
-		// TODO(rstambler): Handle range statements.
 		default:
 			return true
 		}
 	})
-	return formatResult(resultExpr)
+	// Construct a fake type for the object and return a fake object with this type.
+	typename := formatNode(fset, resultExpr)
+	typ := types.NewNamed(types.NewTypeName(token.NoPos, obj.Pkg(), typename, nil), types.Typ[types.Invalid], nil)
+	return types.NewVar(obj.Pos(), obj.Pkg(), obj.Name(), typ)
 }
 
 func isPointer(T types.Type) bool {
@@ -332,12 +387,21 @@ func isPointer(T types.Type) bool {
 	return ok
 }
 
-// deref returns a pointer's element type; otherwise it returns typ.
+func isVar(obj types.Object) bool {
+	_, ok := obj.(*types.Var)
+	return ok
+}
+
+// deref returns a pointer's element type, traversing as many levels as needed.
+// Otherwise it returns typ.
 func deref(typ types.Type) types.Type {
-	if p, ok := typ.Underlying().(*types.Pointer); ok {
-		return p.Elem()
+	for {
+		p, ok := typ.Underlying().(*types.Pointer)
+		if !ok {
+			return typ
+		}
+		typ = p.Elem()
 	}
-	return typ
 }
 
 func isTypeName(obj types.Object) bool {
@@ -376,6 +440,16 @@ func enclosingSelector(path []ast.Node, pos token.Pos) *ast.SelectorExpr {
 	if _, ok := path[0].(*ast.Ident); ok && len(path) > 1 {
 		if sel, ok := path[1].(*ast.SelectorExpr); ok && pos >= sel.Sel.Pos() {
 			return sel
+		}
+	}
+
+	return nil
+}
+
+func enclosingValueSpec(path []ast.Node, pos token.Pos) *ast.ValueSpec {
+	for _, n := range path {
+		if vs, ok := n.(*ast.ValueSpec); ok {
+			return vs
 		}
 	}
 
@@ -453,12 +527,15 @@ func formatFieldType(s Snapshot, srcpkg Package, obj types.Object, qf types.Qual
 	if !ok {
 		return "", errors.Errorf("ident %s is not a field type", ident.Name)
 	}
-	var typeNameBuf bytes.Buffer
-	fset := s.View().Session().Cache().FileSet()
-	if err := printer.Fprint(&typeNameBuf, fset, f.Type); err != nil {
-		return "", err
+	return formatNode(s.View().Session().Cache().FileSet(), f.Type), nil
+}
+
+func formatNode(fset *token.FileSet, n ast.Node) string {
+	var buf strings.Builder
+	if err := printer.Fprint(&buf, fset, n); err != nil {
+		return ""
 	}
-	return typeNameBuf.String(), nil
+	return buf.String()
 }
 
 func formatResults(tup *types.Tuple, qf types.Qualifier) ([]string, bool) {
@@ -531,4 +608,23 @@ func formatFunction(params []string, results []string, writeResultParens bool) s
 	}
 
 	return detail.String()
+}
+
+func SortDiagnostics(d []Diagnostic) {
+	sort.Slice(d, func(i int, j int) bool {
+		return CompareDiagnostic(d[i], d[j]) < 0
+	})
+}
+
+func CompareDiagnostic(a, b Diagnostic) int {
+	if r := protocol.CompareRange(a.Range, b.Range); r != 0 {
+		return r
+	}
+	if a.Message < b.Message {
+		return -1
+	}
+	if a.Message == b.Message {
+		return 0
+	}
+	return 1
 }

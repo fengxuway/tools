@@ -46,7 +46,7 @@ var (
 		TextDocumentSyncKind:   protocol.Incremental,
 		HoverKind:              SynopsisDocumentation,
 		InsertTextFormat:       protocol.PlainTextTextFormat,
-		PreferredContentFormat: protocol.PlainText,
+		PreferredContentFormat: protocol.Markdown,
 		SupportedCodeActions: map[FileKind]map[protocol.CodeActionKind]bool{
 			Go: {
 				protocol.SourceOrganizeImports: true,
@@ -64,12 +64,14 @@ var (
 			Documentation: true,
 			Deep:          true,
 			FuzzyMatching: true,
+			Literal:       true,
 			Budget:        100 * time.Millisecond,
 		},
 		ComputeEdits: myers.ComputeEdits,
 		Analyzers:    defaultAnalyzers,
 		GoDiff:       true,
 		LinkTarget:   "pkg.go.dev",
+		TempModfile:  false,
 	}
 )
 
@@ -112,6 +114,11 @@ type Options struct {
 
 	VerboseOutput bool
 
+	// WARNING: This configuration will be changed in the future.
+	// It only exists while this feature is under development.
+	// Disable use of the -modfile flag in Go 1.14.
+	TempModfile bool
+
 	LinkTarget string
 }
 
@@ -123,6 +130,7 @@ type CompletionOptions struct {
 	Documentation     bool
 	FullDocumentation bool
 	Placeholders      bool
+	Literal           bool
 
 	// Budget is the soft latency goal for completion requests. Most
 	// requests finish in a couple milliseconds, but in some cases deep
@@ -248,6 +256,15 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 		result.setBool(&o.Completion.CaseSensitive)
 	case "completeUnimported":
 		result.setBool(&o.Completion.Unimported)
+	case "completionBudget":
+		if v, ok := result.asString(); ok {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				result.errorf("failed to parse duration %q: %v", v, err)
+				break
+			}
+			o.Completion.Budget = d
+		}
 
 	case "hoverKind":
 		hoverKind, ok := value.(string)
@@ -306,6 +323,9 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 	case "verboseOutput":
 		result.setBool(&o.VerboseOutput)
 
+	case "tempModfile":
+		result.setBool(&o.TempModfile)
+
 	// Deprecated settings.
 	case "wantSuggestedFixes":
 		result.State = OptionDeprecated
@@ -341,6 +361,15 @@ func (r *OptionResult) asBool() (bool, bool) {
 	if !ok {
 		r.errorf("Invalid type %T for bool option %q", r.Value, r.Name)
 		return false, false
+	}
+	return b, true
+}
+
+func (r *OptionResult) asString() (string, bool) {
+	b, ok := r.Value.(string)
+	if !ok {
+		r.errorf("Invalid type %T for string option %q", r.Value, r.Name)
+		return "", false
 	}
 	return b, true
 }

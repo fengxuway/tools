@@ -7,17 +7,23 @@ import (
 	"golang.org/x/tools/internal/lsp/protocol"
 )
 
-type F struct{ bar int }
+type F struct{ bar int } //@mark(barDeclaration, "bar"),highlight(barDeclaration, barDeclaration, bar1, bar2, bar3)
 
-var foo = F{bar: 52} //@mark(fooDeclaration, "foo"),highlight(fooDeclaration, fooDeclaration, fooUse)
+func _() F {
+	return F{
+		bar: 123, //@mark(bar1, "bar"),highlight(bar1, barDeclaration, bar1, bar2, bar3)
+	}
+}
+
+var foo = F{bar: 52} //@mark(fooDeclaration, "foo"),mark(bar2, "bar"),highlight(fooDeclaration, fooDeclaration, fooUse),highlight(bar2, barDeclaration, bar1, bar2, bar3)
 
 func Print() { //@mark(printFunc, "Print"),highlight(printFunc, printFunc, printTest)
 	fmt.Println(foo) //@mark(fooUse, "foo"),highlight(fooUse, fooDeclaration, fooUse)
 	fmt.Print("yo")  //@mark(printSep, "Print"),highlight(printSep, printSep, print1, print2)
 }
 
-func (x *F) Inc() { //@mark(xDeclaration, "x"),highlight(xDeclaration, xDeclaration, xUse)
-	x.bar++ //@mark(xUse, "x"),highlight(xUse, xDeclaration, xUse)
+func (x *F) Inc() { //@mark(xRightDecl, "x"),mark(xLeftDecl, " *"),highlight(xRightDecl, xRightDecl, xUse),highlight(xLeftDecl, xRightDecl, xUse)
+	x.bar++ //@mark(xUse, "x"),mark(bar3, "bar"),highlight(xUse, xRightDecl, xUse),highlight(bar3, barDeclaration, bar1, bar2, bar3)
 }
 
 func testFunctions() {
@@ -94,4 +100,9 @@ func testReturnMultipleFields() (float32, string) { //@mark(retVal31, "float32")
 		return 20.1, y //@mark(retVal41, "20.1"),mark(retVal42, "y"),highlight(retVal41, retVal31, retVal41, retVal51),highlight(retVal42, retVal32, yDecl, retVal42, retVal52)
 	}
 	return 4.9, "test" //@mark(retVal51, "4.9"),mark(retVal52, "\"test\""),highlight(retVal51, retVal31, retVal41, retVal51),highlight(retVal52, retVal32, retVal42, retVal52)
+}
+
+func testReturnFunc() int32 { //@mark(retCall, "int32")
+	mulch := 1          //@mark(mulchDec, "mulch"),highlight(mulchDec, mulchDec, mulchRet)
+	return int32(mulch) //@mark(mulchRet, "mulch"),mark(retFunc, "int32"),mark(retTotal, "int32(mulch)"),highlight(mulchRet, mulchDec, mulchRet),highlight(retFunc, retCall, retFunc, retTotal)
 }

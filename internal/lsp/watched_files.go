@@ -34,16 +34,20 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 				if s.session.DidChangeOutOfBand(ctx, uri, action) {
 					// If we had been tracking the given file,
 					// recompute diagnostics to reflect updated file contents.
-					go s.diagnoseFile(view.Snapshot(), uri)
+					snapshot := view.Snapshot()
+					fh, err := snapshot.GetFile(ctx, uri)
+					if err != nil {
+						return err
+					}
+					return s.diagnose(snapshot, fh)
 				}
 			case source.Delete:
-				f := view.FindFile(ctx, uri)
+				snapshot := view.Snapshot()
+				fh := snapshot.FindFile(ctx, uri)
 				// If we have never seen this file before, there is nothing to do.
-				if f == nil {
+				if fh == nil {
 					continue
 				}
-				snapshot := view.Snapshot()
-				fh := snapshot.Handle(ctx, f)
 				phs, err := snapshot.PackageHandles(ctx, fh)
 				if err != nil {
 					log.Error(ctx, "didChangeWatchedFiles: CheckPackageHandles", err, telemetry.File)
@@ -56,12 +60,12 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 				}
 				// Find a different file in the same package we can use to trigger diagnostics.
 				// TODO(rstambler): Allow diagnostics to be called per-package to avoid this.
-				var otherFile source.File
+				var otherFile source.FileHandle
 				for _, pgh := range ph.CompiledGoFiles() {
-					if pgh.File().Identity().URI == f.URI() {
+					if pgh.File().Identity().URI == fh.Identity().URI {
 						continue
 					}
-					if f := view.FindFile(ctx, pgh.File().Identity().URI); f != nil && s.session.IsOpen(f.URI()) {
+					if f := snapshot.FindFile(ctx, pgh.File().Identity().URI); f != nil && s.session.IsOpen(fh.Identity().URI) {
 						otherFile = f
 						break
 					}
@@ -72,16 +76,17 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 
 				// If this was the only file in the package, clear its diagnostics.
 				if otherFile == nil {
-					if err := s.publishDiagnostics(ctx, source.FileIdentity{
-						URI: uri,
-					}, []source.Diagnostic{}); err != nil {
+					if err := s.client.PublishDiagnostics(ctx, &protocol.PublishDiagnosticsParams{
+						URI:     protocol.NewURI(uri),
+						Version: fh.Identity().Version,
+					}); err != nil {
 						log.Error(ctx, "failed to clear diagnostics", err, telemetry.URI.Of(uri))
 					}
 					return nil
 				}
 
 				// Refresh diagnostics for the package the file belonged to.
-				go s.diagnoseFile(view.Snapshot(), otherFile.URI())
+				go s.diagnoseFile(view.Snapshot(), otherFile)
 			}
 		}
 	}

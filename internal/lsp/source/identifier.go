@@ -6,6 +6,7 @@ package source
 
 import (
 	"context"
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -13,7 +14,6 @@ import (
 
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/internal/lsp/protocol"
-	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/telemetry/trace"
 	errors "golang.org/x/xerrors"
 )
@@ -21,7 +21,6 @@ import (
 // IdentifierInfo holds information about an identifier in Go source.
 type IdentifierInfo struct {
 	Name     string
-	File     ParseGoHandle
 	Snapshot Snapshot
 	mappedRange
 
@@ -32,40 +31,41 @@ type IdentifierInfo struct {
 
 	Declaration Declaration
 
-	pkg   Package
 	ident *ast.Ident
-	qf    types.Qualifier
+
+	// enclosing is an expression used to determine the link anchor for an identifier.
+	enclosing types.Type
+
+	pkg Package
+	qf  types.Qualifier
 }
 
 type Declaration struct {
 	mappedRange
-	node        ast.Node
-	obj         types.Object
-	wasImplicit bool
+	node ast.Node
+	obj  types.Object
+}
+
+func (i *IdentifierInfo) DeclarationReferenceInfo() *ReferenceInfo {
+	return &ReferenceInfo{
+		Name:          i.Declaration.obj.Name(),
+		mappedRange:   i.Declaration.mappedRange,
+		obj:           i.Declaration.obj,
+		ident:         i.ident,
+		pkg:           i.pkg,
+		isDeclaration: true,
+	}
 }
 
 // Identifier returns identifier information for a position
 // in a file, accounting for a potentially incomplete selector.
-func Identifier(ctx context.Context, snapshot Snapshot, f File, pos protocol.Position) (*IdentifierInfo, error) {
+func Identifier(ctx context.Context, snapshot Snapshot, fh FileHandle, pos protocol.Position, selectPackage PackagePolicy) (*IdentifierInfo, error) {
 	ctx, done := trace.StartSpan(ctx, "source.Identifier")
 	defer done()
 
-	fh := snapshot.Handle(ctx, f)
-	phs, err := snapshot.PackageHandles(ctx, fh)
+	pkg, pgh, err := getParsedFile(ctx, snapshot, fh, selectPackage)
 	if err != nil {
-		return nil, err
-	}
-	ph, err := WidestCheckPackageHandle(phs)
-	if err != nil {
-		return nil, err
-	}
-	pkg, err := ph.Check(ctx)
-	if err != nil {
-		return nil, err
-	}
-	pgh, err := pkg.File(f.URI())
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getting file for Identifier: %v", err)
 	}
 	file, m, _, err := pgh.Cached()
 	if err != nil {
@@ -82,6 +82,8 @@ func Identifier(ctx context.Context, snapshot Snapshot, f File, pos protocol.Pos
 	return findIdentifier(snapshot, pkg, file, rng.Start)
 }
 
+var ErrNoIdentFound = errors.New("no identifier found")
+
 func findIdentifier(snapshot Snapshot, pkg Package, file *ast.File, pos token.Pos) (*IdentifierInfo, error) {
 	if result, err := identifier(snapshot, pkg, file, pos); err != nil || result != nil {
 		return result, err
@@ -91,7 +93,7 @@ func findIdentifier(snapshot Snapshot, pkg Package, file *ast.File, pos token.Po
 	// requesting a completion), use the path to the preceding node.
 	ident, err := identifier(snapshot, pkg, file, pos-1)
 	if ident == nil && err == nil {
-		err = errors.New("no identifier found")
+		err = ErrNoIdentFound
 	}
 	return ident, err
 }
@@ -108,21 +110,16 @@ func identifier(s Snapshot, pkg Package, file *ast.File, pos token.Pos) (*Identi
 	if path == nil {
 		return nil, errors.Errorf("can't find node enclosing position")
 	}
+
 	view := s.View()
-	uri := span.FileURI(view.Session().Cache().FileSet().Position(pos).Filename)
-	var ph ParseGoHandle
-	for _, h := range pkg.CompiledGoFiles() {
-		if h.File().Identity().URI == uri {
-			ph = h
-		}
-	}
 	result := &IdentifierInfo{
-		File:     ph,
-		Snapshot: s,
-		qf:       qualifier(file, pkg.GetTypes(), pkg.GetTypesInfo()),
-		pkg:      pkg,
-		ident:    searchForIdent(path[0]),
+		Snapshot:  s,
+		qf:        qualifier(file, pkg.GetTypes(), pkg.GetTypesInfo()),
+		pkg:       pkg,
+		ident:     searchForIdent(path[0]),
+		enclosing: searchForEnclosing(pkg, path),
 	}
+
 	// No identifier at the given position.
 	if result.ident == nil {
 		return nil, nil
@@ -148,7 +145,6 @@ func identifier(s Snapshot, pkg Package, file *ast.File, pos token.Pos) (*Identi
 			// used to connect it back to the declaration.
 			// Preserve the first of these objects and treat it as if it were the declaring object.
 			result.Declaration.obj = objs[0]
-			result.Declaration.wasImplicit = true
 		} else {
 			// Probably a type error.
 			return nil, errors.Errorf("no object for ident %v", result.Name)
@@ -179,15 +175,6 @@ func identifier(s Snapshot, pkg Package, file *ast.File, pos token.Pos) (*Identi
 			if typObj := typeToObject(v.Type()); typObj != nil {
 				result.Declaration.obj = typObj
 			}
-		}
-	}
-
-	for _, obj := range pkg.GetTypesInfo().Implicits {
-		if obj.Pos() == result.Declaration.obj.Pos() {
-			// Mark this declaration as implicit, since it will not
-			// appear in a (*types.Info).Defs map.
-			result.Declaration.wasImplicit = true
-			break
 		}
 	}
 
@@ -223,6 +210,28 @@ func searchForIdent(n ast.Node) *ast.Ident {
 		return node.Sel
 	case *ast.StarExpr:
 		return searchForIdent(node.X)
+	}
+	return nil
+}
+
+func searchForEnclosing(pkg Package, path []ast.Node) types.Type {
+	for _, n := range path {
+		switch n := n.(type) {
+		case *ast.SelectorExpr:
+			if selection, ok := pkg.GetTypesInfo().Selections[n]; ok {
+				return deref(selection.Recv())
+			}
+		case *ast.CompositeLit:
+			if t, ok := pkg.GetTypesInfo().Types[n]; ok {
+				return t.Type
+			}
+		case *ast.TypeSpec:
+			if _, ok := n.Type.(*ast.StructType); ok {
+				if t, ok := pkg.GetTypesInfo().Defs[n.Name]; ok {
+					return t.Type()
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -284,15 +293,7 @@ func importSpec(s Snapshot, pkg Package, file *ast.File, pos token.Pos) (*Identi
 	if err != nil {
 		return nil, errors.Errorf("import path not quoted: %s (%v)", imp.Path.Value, err)
 	}
-	uri := span.FileURI(s.View().Session().Cache().FileSet().Position(pos).Filename)
-	var ph ParseGoHandle
-	for _, h := range pkg.CompiledGoFiles() {
-		if h.File().Identity().URI == uri {
-			ph = h
-		}
-	}
 	result := &IdentifierInfo{
-		File:     ph,
 		Snapshot: s,
 		Name:     importPath,
 		pkg:      pkg,

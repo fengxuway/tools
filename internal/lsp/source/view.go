@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"go/types"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/imports"
@@ -23,8 +24,13 @@ type Snapshot interface {
 	// View returns the View associated with this snapshot.
 	View() View
 
-	// Handle returns the FileHandle for the given file.
-	Handle(ctx context.Context, f File) FileHandle
+	// GetFile returns the file object for a given URI, initializing it
+	// if it is not already part of the view.
+	GetFile(ctx context.Context, uri span.URI) (FileHandle, error)
+
+	// FindFile returns the file object for a given URI if it is
+	// already part of the view.
+	FindFile(ctx context.Context, uri span.URI) FileHandle
 
 	// Analyze runs the analyses for the given package at this snapshot.
 	Analyze(ctx context.Context, id string, analyzers []*analysis.Analyzer) ([]*Error, error)
@@ -39,6 +45,10 @@ type Snapshot interface {
 	// PackageHandles returns the CheckPackageHandles for the packages
 	// that this file belongs to.
 	PackageHandles(ctx context.Context, fh FileHandle) ([]PackageHandle, error)
+
+	// WorkspacePackageIDs returns the ids of the packages at the top-level
+	// of the snapshot's view.
+	WorkspacePackageIDs(ctx context.Context) []string
 
 	// GetActiveReverseDeps returns the active files belonging to the reverse
 	// dependencies of this file's package.
@@ -87,17 +97,6 @@ type View interface {
 	// BuiltinPackage returns the type information for the special "builtin" package.
 	BuiltinPackage() BuiltinPackage
 
-	// GetFile returns the file object for a given URI, initializing it
-	// if it is not already part of the view.
-	GetFile(ctx context.Context, uri span.URI) (File, error)
-
-	// FindFile returns the file object for a given URI if it is
-	// already part of the view.
-	FindFile(ctx context.Context, uri span.URI) File
-
-	// Called to set the effective contents of a file from this view.
-	SetContent(ctx context.Context, uri span.URI, version float64, content []byte)
-
 	// BackgroundContext returns a context used for all background processing
 	// on behalf of this view.
 	BackgroundContext() context.Context
@@ -128,6 +127,8 @@ type View interface {
 	// belong to or be part of a dependency of the given package.
 	FindPosInPackage(pkg Package, pos token.Pos) (*ast.File, Package, error)
 
+	// FindMapperInPackage returns the mapper associated with a file that may belong to
+	// the given package or one of its dependencies.
 	FindMapperInPackage(pkg Package, uri span.URI) (*protocol.ColumnMapper, error)
 
 	// Snapshot returns the current snapshot for the view.
@@ -140,7 +141,7 @@ type View interface {
 // A session may have many active views at any given time.
 type Session interface {
 	// NewView creates a new View and returns it.
-	NewView(ctx context.Context, name string, folder span.URI, options Options) (View, []PackageHandle, error)
+	NewView(ctx context.Context, name string, folder span.URI, options Options) (View, Snapshot, error)
 
 	// Cache returns the cache that created this session.
 	Cache() Cache
@@ -161,20 +162,11 @@ type Session interface {
 	// content from the underlying cache if no overlay is present.
 	FileSystem
 
-	// DidOpen is invoked each time a file is opened in the editor.
-	DidOpen(ctx context.Context, uri span.URI, kind FileKind, version float64, text []byte) error
-
-	// DidSave is invoked each time an open file is saved in the editor.
-	DidSave(uri span.URI, version float64)
-
-	// DidClose is invoked each time an open file is closed in the editor.
-	DidClose(uri span.URI)
-
 	// IsOpen returns whether the editor currently has a file open.
 	IsOpen(uri span.URI) bool
 
-	// Called to set the effective contents of a file from this session.
-	SetOverlay(uri span.URI, kind FileKind, version float64, data []byte)
+	// DidModifyFile reports a file modification to the session.
+	DidModifyFile(ctx context.Context, c FileModification) ([]Snapshot, error)
 
 	// DidChangeOutOfBand is called when a file under the root folder changes.
 	// If the file was open in the editor, it returns true.
@@ -187,12 +179,27 @@ type Session interface {
 	SetOptions(Options)
 }
 
+// FileModification represents a modification to a file.
+type FileModification struct {
+	URI    span.URI
+	Action FileAction
+
+	// Version will be -1 and Text will be nil when they are not supplied,
+	// specifically on textDocument/didClose.
+	Version float64
+	Text    []byte
+
+	// LanguageID is only sent from the language client on textDocument/didOpen.
+	LanguageID string
+}
+
 type FileAction int
 
 const (
 	Open = FileAction(iota)
-	Close
 	Change
+	Close
+	Save
 	Create
 	Delete
 	UnknownFileAction
@@ -214,6 +221,9 @@ type Cache interface {
 
 	// FileSet returns the shared fileset used by all files in the system.
 	FileSet() *token.FileSet
+
+	// ParseGoHandle returns a go.mod ParseGoHandle for the given file handle.
+	ParseModHandle(fh FileHandle) ParseModHandle
 
 	// ParseGoHandle returns a ParseGoHandle for the given file handle.
 	ParseGoHandle(fh FileHandle, mode ParseMode) ParseGoHandle
@@ -239,6 +249,16 @@ type ParseGoHandle interface {
 
 	// Cached returns the AST for this handle, if it has already been stored.
 	Cached() (*ast.File, *protocol.ColumnMapper, error, error)
+}
+
+// ParseModHandle represents a handle to the modfile for a go.mod.
+type ParseModHandle interface {
+	// File returns a file handle for which to get the modfile.
+	File() FileHandle
+
+	// Parse returns the parsed modifle for the go.mod file.
+	// If the file is not available, returns nil and an error.
+	Parse(ctx context.Context) (*modfile.File, error)
 }
 
 // ParseMode controls the content of the AST produced when parsing a source file.
@@ -294,12 +314,6 @@ func (fileID FileIdentity) String() string {
 	// Version is not part of the FileIdentity string,
 	// as it can remain change even if the file does not.
 	return fmt.Sprintf("%s%s%s", fileID.URI, fileID.Identifier, fileID.Kind)
-}
-
-// File represents a source file of any type.
-type File interface {
-	URI() span.URI
-	Kind() FileKind
 }
 
 // FileKind describes the kind of the file in question.

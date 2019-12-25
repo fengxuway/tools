@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
@@ -24,12 +25,20 @@ func (s *Server) completion(ctx context.Context, params *protocol.CompletionPara
 	}
 	snapshot := view.Snapshot()
 	options := view.Options()
-	f, err := view.GetFile(ctx, uri)
+	fh, err := snapshot.GetFile(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
-	options.Completion.FullDocumentation = options.HoverKind == source.FullDocumentation
-	candidates, surrounding, err := source.Completion(ctx, snapshot, f, params.Position, options.Completion)
+	var candidates []source.CompletionItem
+	var surrounding *source.Selection
+	switch fh.Identity().Kind {
+	case source.Go:
+		options.Completion.FullDocumentation = options.HoverKind == source.FullDocumentation
+		candidates, surrounding, err = source.Completion(ctx, snapshot, fh, params.Position, options.Completion)
+	case source.Mod:
+		candidates, surrounding = nil, nil
+	}
+
 	if err != nil {
 		log.Print(ctx, "no completions found", tag.Of("At", params.Position), tag.Of("Failure", err))
 	}
@@ -105,7 +114,7 @@ func toProtocolCompletionItems(candidates []source.CompletionItem, rng protocol.
 			Label:  candidate.Label,
 			Detail: candidate.Detail,
 			Kind:   candidate.Kind,
-			TextEdit: protocol.TextEdit{
+			TextEdit: &protocol.TextEdit{
 				NewText: insertText,
 				Range:   rng,
 			},
@@ -114,8 +123,12 @@ func toProtocolCompletionItems(candidates []source.CompletionItem, rng protocol.
 			// This is a hack so that the client sorts completion results in the order
 			// according to their score. This can be removed upon the resolution of
 			// https://github.com/Microsoft/language-server-protocol/issues/348.
-			SortText:      fmt.Sprintf("%05d", i),
-			FilterText:    candidate.InsertText,
+			SortText: fmt.Sprintf("%05d", i),
+
+			// Trim address operator (VSCode doesn't like weird characters
+			// in filterText).
+			FilterText: strings.TrimLeft(candidate.InsertText, "&"),
+
 			Preselect:     i == 0,
 			Documentation: candidate.Documentation,
 		}
@@ -124,7 +137,7 @@ func toProtocolCompletionItems(candidates []source.CompletionItem, rng protocol.
 		// since we show return types as well.
 		switch item.Kind {
 		case protocol.FunctionCompletion, protocol.MethodCompletion:
-			item.Command = protocol.Command{
+			item.Command = &protocol.Command{
 				Command: "editor.action.triggerParameterHints",
 			}
 		}

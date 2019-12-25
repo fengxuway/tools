@@ -27,11 +27,13 @@ func (s *Server) documentLink(ctx context.Context, params *protocol.DocumentLink
 	if err != nil {
 		return nil, err
 	}
-	f, err := view.GetFile(ctx, uri)
+	fh, err := view.Snapshot().GetFile(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
-	fh := view.Snapshot().Handle(ctx, f)
+	if fh.Identity().Kind == source.Mod {
+		return nil, nil
+	}
 	file, m, _, err := view.Session().Cache().ParseGoHandle(fh, source.ParseFull).Parse(ctx)
 	if err != nil {
 		return nil, err
@@ -98,8 +100,8 @@ func findLinksInString(src string, pos token.Pos, view source.View, mapper *prot
 		end := urlIndex[1]
 		startPos := token.Pos(int(pos) + start)
 		endPos := token.Pos(int(pos) + end)
-	        target = src[start:end]
-	        l, err := toProtocolLink(view, mapper, target, startPos, endPos)
+		target = src[start:end]
+		l, err := toProtocolLink(view, mapper, target, startPos, endPos)
 		if err != nil {
 			return nil, err
 		}

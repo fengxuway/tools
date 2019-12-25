@@ -47,10 +47,6 @@ type parseGoData struct {
 	err        error
 }
 
-func (pgh *parseGoHandle) String() string {
-	return pgh.File().Identity().URI.Filename()
-}
-
 func (c *cache) ParseGoHandle(fh source.FileHandle, mode source.ParseMode) source.ParseGoHandle {
 	key := parseKey{
 		file: fh.Identity(),
@@ -67,6 +63,10 @@ func (c *cache) ParseGoHandle(fh source.FileHandle, mode source.ParseMode) sourc
 		file:   fh,
 		mode:   mode,
 	}
+}
+
+func (pgh *parseGoHandle) String() string {
+	return pgh.File().Identity().URI.Filename()
 }
 
 func (pgh *parseGoHandle) File() source.FileHandle {
@@ -203,18 +203,23 @@ func isEllipsisArray(n ast.Expr) bool {
 func fix(ctx context.Context, n ast.Node, tok *token.File, src []byte) error {
 	var (
 		ancestors []ast.Node
-		parent    ast.Node
 		err       error
 	)
-	ast.Inspect(n, func(n ast.Node) bool {
-		if n == nil {
-			if len(ancestors) > 0 {
-				ancestors = ancestors[:len(ancestors)-1]
-				if len(ancestors) > 0 {
-					parent = ancestors[len(ancestors)-1]
-				}
+	ast.Inspect(n, func(n ast.Node) (recurse bool) {
+		defer func() {
+			if recurse {
+				ancestors = append(ancestors, n)
 			}
+		}()
+
+		if n == nil {
+			ancestors = ancestors[:len(ancestors)-1]
 			return false
+		}
+
+		var parent ast.Node
+		if len(ancestors) > 0 {
+			parent = ancestors[len(ancestors)-1]
 		}
 
 		switch n := n.(type) {
@@ -260,8 +265,6 @@ func fix(ctx context.Context, n ast.Node, tok *token.File, src []byte) error {
 			fixPhantomSelector(n, tok, src)
 			return true
 		default:
-			ancestors = append(ancestors, n)
-			parent = n
 			return true
 		}
 	})
