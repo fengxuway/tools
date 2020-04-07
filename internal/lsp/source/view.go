@@ -10,71 +10,87 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"io"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/imports"
 	"golang.org/x/tools/internal/lsp/protocol"
+	"golang.org/x/tools/internal/packagesinternal"
 	"golang.org/x/tools/internal/span"
 )
 
 // Snapshot represents the current state for the given view.
 type Snapshot interface {
+	ID() uint64
+
 	// View returns the View associated with this snapshot.
 	View() View
 
+	// Config returns the configuration for the view.
+	Config(ctx context.Context) *packages.Config
+
 	// GetFile returns the file object for a given URI, initializing it
 	// if it is not already part of the view.
-	GetFile(ctx context.Context, uri span.URI) (FileHandle, error)
+	GetFile(uri span.URI) (FileHandle, error)
 
-	// FindFile returns the file object for a given URI if it is
-	// already part of the view.
-	FindFile(ctx context.Context, uri span.URI) FileHandle
+	// IsOpen returns whether the editor currently has a file open.
+	IsOpen(uri span.URI) bool
+
+	// IsSaved returns whether the contents are saved on disk or not.
+	IsSaved(uri span.URI) bool
 
 	// Analyze runs the analyses for the given package at this snapshot.
 	Analyze(ctx context.Context, id string, analyzers []*analysis.Analyzer) ([]*Error, error)
 
 	// FindAnalysisError returns the analysis error represented by the diagnostic.
 	// This is used to get the SuggestedFixes associated with that error.
-	FindAnalysisError(ctx context.Context, pkgID, analyzerName, msg string, rng protocol.Range) (*Error, error)
+	FindAnalysisError(ctx context.Context, pkgID, analyzerName, msg string, rng protocol.Range) (*Error, *Analyzer, error)
 
-	// PackageHandle returns the CheckPackageHandle for the given package ID.
-	PackageHandle(ctx context.Context, id string) (PackageHandle, error)
+	// ModTidyHandle returns a ModTidyHandle for the given go.mod file handle.
+	// This function can have no data or error if there is no modfile detected.
+	ModTidyHandle(ctx context.Context, fh FileHandle) (ModTidyHandle, error)
 
-	// PackageHandles returns the CheckPackageHandles for the packages
-	// that this file belongs to.
+	// ModHandle returns a ModHandle for the passed in go.mod file handle.
+	// This function can have no data if there is no modfile detected.
+	ModHandle(ctx context.Context, fh FileHandle) ModHandle
+
+	// PackageHandles returns the PackageHandles for the packages that this file
+	// belongs to.
 	PackageHandles(ctx context.Context, fh FileHandle) ([]PackageHandle, error)
-
-	// WorkspacePackageIDs returns the ids of the packages at the top-level
-	// of the snapshot's view.
-	WorkspacePackageIDs(ctx context.Context) []string
 
 	// GetActiveReverseDeps returns the active files belonging to the reverse
 	// dependencies of this file's package.
-	GetReverseDependencies(id string) []string
+	GetReverseDependencies(ctx context.Context, id string) ([]PackageHandle, error)
 
-	// KnownImportPaths returns all the imported packages loaded in this snapshot,
+	// CachedImportPaths returns all the imported packages loaded in this snapshot,
 	// indexed by their import path.
-	KnownImportPaths() map[string]Package
+	CachedImportPaths(ctx context.Context) (map[string]Package, error)
 
 	// KnownPackages returns all the packages loaded in this snapshot.
-	KnownPackages(ctx context.Context) []Package
+	// Workspace packages may be parsed in ParseFull mode, whereas transitive
+	// dependencies will be in ParseExported mode.
+	KnownPackages(ctx context.Context) ([]PackageHandle, error)
+
+	// WorkspacePackages returns the PackageHandles for the snapshot's
+	// top-level packages.
+	WorkspacePackages(ctx context.Context) ([]PackageHandle, error)
 }
 
 // PackageHandle represents a handle to a specific version of a package.
 // It is uniquely defined by the file handles that make up the package.
 type PackageHandle interface {
-	// ID returns the ID of the package associated with the CheckPackageHandle.
+	// ID returns the ID of the package associated with the PackageHandle.
 	ID() string
 
 	// CompiledGoFiles returns the ParseGoHandles composing the package.
 	CompiledGoFiles() []ParseGoHandle
 
-	// Check returns the type-checked Package for the CheckPackageHandle.
+	// Check returns the type-checked Package for the PackageHandle.
 	Check(ctx context.Context) (Package, error)
 
-	// Cached returns the Package for the CheckPackageHandle if it has already been stored.
+	// Cached returns the Package for the PackageHandle if it has already been stored.
 	Cached() (Package, error)
 
 	// MissingDependencies reports any unresolved imports.
@@ -94,8 +110,11 @@ type View interface {
 	// Folder returns the root folder for this view.
 	Folder() span.URI
 
-	// BuiltinPackage returns the type information for the special "builtin" package.
-	BuiltinPackage() BuiltinPackage
+	// ModFiles returns the URIs of the go.mod files attached to the view associated with this snapshot.
+	ModFiles() (span.URI, span.URI)
+
+	// LookupBuiltin returns the go/ast.Object for the given name in the builtin package.
+	LookupBuiltin(ctx context.Context, name string) (*ast.Object, error)
 
 	// BackgroundContext returns a context used for all background processing
 	// on behalf of this view.
@@ -107,12 +126,12 @@ type View interface {
 	// Ignore returns true if this file should be ignored by this view.
 	Ignore(span.URI) bool
 
-	// Config returns the configuration for the view.
-	Config(ctx context.Context) *packages.Config
+	// WriteEnv writes the view-specific environment to the io.Writer.
+	WriteEnv(ctx context.Context, w io.Writer) error
 
-	// RunProcessEnvFunc runs fn with the process env for this view inserted into opts.
+	// RunProcessEnvFunc runs fn with the process env for this snapshot's view.
 	// Note: the process env contains cached module and filesystem state.
-	RunProcessEnvFunc(ctx context.Context, fn func(*imports.Options) error, opts *imports.Options) error
+	RunProcessEnvFunc(ctx context.Context, fn func(*imports.Options) error) error
 
 	// Options returns a copy of the Options for this view.
 	Options() Options
@@ -123,16 +142,16 @@ type View interface {
 	// original one will be.
 	SetOptions(context.Context, Options) (View, error)
 
-	// FindFileInPackage returns the AST and type information for a file that may
-	// belong to or be part of a dependency of the given package.
-	FindPosInPackage(pkg Package, pos token.Pos) (*ast.File, Package, error)
-
-	// FindMapperInPackage returns the mapper associated with a file that may belong to
-	// the given package or one of its dependencies.
-	FindMapperInPackage(pkg Package, uri span.URI) (*protocol.ColumnMapper, error)
-
 	// Snapshot returns the current snapshot for the view.
 	Snapshot() Snapshot
+
+	// Rebuild rebuilds the current view, replacing the original view in its session.
+	Rebuild(ctx context.Context) (Snapshot, error)
+
+	// InvalidBuildConfiguration returns true if there is some error in the
+	// user's workspace. In particular, if they are both outside of a module
+	// and their GOPATH.
+	ValidBuildConfiguration() bool
 }
 
 // Session represents a single connection from a client.
@@ -162,15 +181,9 @@ type Session interface {
 	// content from the underlying cache if no overlay is present.
 	FileSystem
 
-	// IsOpen returns whether the editor currently has a file open.
-	IsOpen(uri span.URI) bool
-
 	// DidModifyFile reports a file modification to the session.
-	DidModifyFile(ctx context.Context, c FileModification) ([]Snapshot, error)
-
-	// DidChangeOutOfBand is called when a file under the root folder changes.
-	// If the file was open in the editor, it returns true.
-	DidChangeOutOfBand(ctx context.Context, uri span.URI, action FileAction) bool
+	// It returns the resulting snapshots, a guaranteed one per view.
+	DidModifyFiles(ctx context.Context, changes []FileModification) ([]Snapshot, error)
 
 	// Options returns a copy of the SessionOptions for this session.
 	Options() Options
@@ -184,8 +197,12 @@ type FileModification struct {
 	URI    span.URI
 	Action FileAction
 
+	// OnDisk is true if a watched file is changed on disk.
+	// If true, Version will be -1 and Text will be nil.
+	OnDisk bool
+
 	// Version will be -1 and Text will be nil when they are not supplied,
-	// specifically on textDocument/didClose.
+	// specifically on textDocument/didClose and for on-disk changes.
 	Version float64
 	Text    []byte
 
@@ -216,14 +233,8 @@ type Cache interface {
 	// A FileSystem that reads file contents from external storage.
 	FileSystem
 
-	// NewSession creates a new Session manager and returns it.
-	NewSession(ctx context.Context) Session
-
 	// FileSet returns the shared fileset used by all files in the system.
 	FileSet() *token.FileSet
-
-	// ParseGoHandle returns a go.mod ParseGoHandle for the given file handle.
-	ParseModHandle(fh FileHandle) ParseModHandle
 
 	// ParseGoHandle returns a ParseGoHandle for the given file handle.
 	ParseGoHandle(fh FileHandle, mode ParseMode) ParseGoHandle
@@ -232,7 +243,7 @@ type Cache interface {
 // FileSystem is the interface to something that provides file contents.
 type FileSystem interface {
 	// GetFile returns a handle for the specified file.
-	GetFile(uri span.URI, kind FileKind) FileHandle
+	GetFile(uri span.URI) FileHandle
 }
 
 // ParseGoHandle represents a handle to the AST for a file.
@@ -245,20 +256,41 @@ type ParseGoHandle interface {
 
 	// Parse returns the parsed AST for the file.
 	// If the file is not available, returns nil and an error.
-	Parse(ctx context.Context) (*ast.File, *protocol.ColumnMapper, error, error)
+	Parse(ctx context.Context) (file *ast.File, src []byte, m *protocol.ColumnMapper, parseErr error, err error)
 
 	// Cached returns the AST for this handle, if it has already been stored.
-	Cached() (*ast.File, *protocol.ColumnMapper, error, error)
+	Cached() (file *ast.File, src []byte, m *protocol.ColumnMapper, parseErr error, err error)
 }
 
-// ParseModHandle represents a handle to the modfile for a go.mod.
-type ParseModHandle interface {
+// ModHandle represents a handle to the modfile for a go.mod.
+type ModHandle interface {
 	// File returns a file handle for which to get the modfile.
 	File() FileHandle
 
-	// Parse returns the parsed modifle for the go.mod file.
+	// Parse returns the parsed modfile and a mapper for the go.mod file.
 	// If the file is not available, returns nil and an error.
-	Parse(ctx context.Context) (*modfile.File, error)
+	Parse(ctx context.Context) (*modfile.File, *protocol.ColumnMapper, error)
+
+	// Upgrades returns the parsed modfile, a mapper, and any dependency upgrades
+	// for the go.mod file. Note that this will only work if the go.mod is the view's go.mod.
+	// If the file is not available, returns nil and an error.
+	Upgrades(ctx context.Context) (*modfile.File, *protocol.ColumnMapper, map[string]string, error)
+
+	// Why returns the parsed modfile, a mapper, and any explanations why a dependency should be
+	// in the go.mod file. Note that this will only work if the go.mod is the view's go.mod.
+	// If the file is not available, returns nil and an error.
+	Why(ctx context.Context) (*modfile.File, *protocol.ColumnMapper, map[string]string, error)
+}
+
+// ModTidyHandle represents a handle to the modfile for the view.
+// Specifically for the purpose of getting diagnostics by running "go mod tidy".
+type ModTidyHandle interface {
+	// File returns a file handle for which to get the modfile.
+	File() FileHandle
+
+	// Tidy returns the parsed modfile, a mapper, and "go mod tidy" errors
+	// for the go.mod file. If the file is not available, returns nil and an error.
+	Tidy(ctx context.Context) (*modfile.File, *protocol.ColumnMapper, map[string]*modfile.Require, []Error, error)
 }
 
 // ParseMode controls the content of the AST produced when parsing a source file.
@@ -299,7 +331,11 @@ type FileHandle interface {
 type FileIdentity struct {
 	URI span.URI
 
-	// Version is the version of the file, as specified by the client.
+	// SessionID is the ID of the LSP session.
+	SessionID string
+
+	// Version is the version of the file, as specified by the client. It should
+	// only be set in combination with SessionID.
 	Version float64
 
 	// Identifier represents a unique identifier for the file.
@@ -327,20 +363,22 @@ const (
 	UnknownKind
 )
 
-type FileURI span.URI
+// Analyzer represents a go/analysis analyzer with some boolean properties
+// that let the user know how to use the analyzer.
+type Analyzer struct {
+	Analyzer *analysis.Analyzer
+	enabled  bool
 
-func (f FileURI) URI() span.URI {
-	return span.URI(f)
+	// If this is true, then we can apply the suggested fixes
+	// as part of a source.FixAll codeaction.
+	HighConfidence bool
 }
 
-type DirectoryURI span.URI
-
-func (d DirectoryURI) URI() span.URI {
-	return span.URI(d)
-}
-
-type Scope interface {
-	URI() span.URI
+func (a Analyzer) Enabled(snapshot Snapshot) bool {
+	if enabled, ok := snapshot.View().Options().UserEnabledAnalyses[a.Analyzer.Name]; ok {
+		return enabled
+	}
+	return a.enabled
 }
 
 // Package represents a Go package that has been type-checked. It maintains
@@ -356,12 +394,14 @@ type Package interface {
 	GetTypesInfo() *types.Info
 	GetTypesSizes() types.Sizes
 	IsIllTyped() bool
+	ForTest() string
 	GetImport(pkgPath string) (Package, error)
 	Imports() []Package
+	Module() *packagesinternal.Module
 }
 
 type Error struct {
-	File           FileIdentity
+	URI            span.URI
 	Range          protocol.Range
 	Kind           ErrorKind
 	Message        string
@@ -381,10 +421,5 @@ const (
 )
 
 func (e *Error) Error() string {
-	return fmt.Sprintf("%s:%s: %s", e.File, e.Range, e.Message)
-}
-
-type BuiltinPackage interface {
-	Lookup(name string) *ast.Object
-	CompiledGoFiles() []ParseGoHandle
+	return fmt.Sprintf("%s:%s: %s", e.URI, e.Range, e.Message)
 }
