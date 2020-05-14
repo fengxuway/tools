@@ -11,10 +11,11 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/lsp/debug"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
-	"golang.org/x/tools/internal/telemetry/event"
 	"golang.org/x/tools/internal/xcontext"
 	errors "golang.org/x/xerrors"
 )
@@ -133,6 +134,7 @@ func (s *Session) createView(ctx context.Context, name string, folder span.URI, 
 			modHandles:        make(map[span.URI]*modHandle),
 		},
 		ignoredURIs: make(map[span.URI]struct{}),
+		gocmdRunner: &gocommand.Runner{},
 	}
 	v.snapshot.view = v
 
@@ -417,6 +419,7 @@ func (s *Session) updateOverlays(ctx context.Context, changes []source.FileModif
 	return overlays, nil
 }
 
+// GetFile implements the source.FileSystem interface.
 func (s *Session) GetFile(uri span.URI) source.FileHandle {
 	if overlay := s.readOverlay(uri); overlay != nil {
 		return overlay
@@ -433,4 +436,17 @@ func (s *Session) readOverlay(uri span.URI) *overlay {
 		return overlay
 	}
 	return nil
+}
+
+func (s *Session) UnsavedFiles() []span.URI {
+	s.overlayMu.Lock()
+	defer s.overlayMu.Unlock()
+
+	var unsaved []span.URI
+	for uri, overlay := range s.overlays {
+		if !overlay.saved {
+			unsaved = append(unsaved, uri)
+		}
+	}
+	return unsaved
 }

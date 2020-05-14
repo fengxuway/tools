@@ -44,7 +44,7 @@ const (
 var UpdateGolden = flag.Bool("golden", false, "Update golden files")
 
 type CodeLens map[span.URI][]protocol.CodeLens
-type Diagnostics map[span.URI][]source.Diagnostic
+type Diagnostics map[span.URI][]*source.Diagnostic
 type CompletionItems map[token.Pos]*source.CompletionItem
 type Completions map[span.Span][]Completion
 type CompletionSnippets map[span.Span][]CompletionSnippet
@@ -116,7 +116,7 @@ type Data struct {
 
 type Tests interface {
 	CodeLens(*testing.T, span.URI, []protocol.CodeLens)
-	Diagnostics(*testing.T, span.URI, []source.Diagnostic)
+	Diagnostics(*testing.T, span.URI, []*source.Diagnostic)
 	Completion(*testing.T, span.Span, Completion, CompletionItems)
 	CompletionSnippet(*testing.T, span.Span, CompletionSnippet, bool, CompletionItems)
 	UnimportedCompletion(*testing.T, span.Span, Completion, CompletionItems)
@@ -222,6 +222,7 @@ func DefaultOptions() source.Options {
 		},
 		source.Sum: {},
 	}
+	o.UserOptions.EnabledCodeLens[source.CommandTest] = true
 	o.HoverKind = source.SynopsisDocumentation
 	o.InsertTextFormat = protocol.SnippetTextFormat
 	o.CompletionBudget = time.Minute
@@ -229,9 +230,12 @@ func DefaultOptions() source.Options {
 	return o
 }
 
-var haveCgo = false
+var (
+	haveCgo = false
+	go115   = false
+)
 
-// For Load() to properly create the folder structure required when testing with modules.
+// Load creates the folder structure required when testing with modules.
 // The directory structure of a test needs to look like the example below:
 //
 // - dir
@@ -452,6 +456,9 @@ func Run(t *testing.T, tests Tests, data *Data) {
 					if (!haveCgo || runtime.GOOS == "android") && strings.Contains(t.Name(), "cgo") {
 						t.Skip("test requires cgo, not supported")
 					}
+					if !go115 && strings.Contains(t.Name(), "declarecgo") {
+						t.Skip("test requires Go 1.15")
+					}
 					test(t, src, e, data.CompletionItems)
 				})
 			}
@@ -609,6 +616,9 @@ func Run(t *testing.T, tests Tests, data *Data) {
 				t.Helper()
 				if (!haveCgo || runtime.GOOS == "android") && strings.Contains(t.Name(), "cgo") {
 					t.Skip("test requires cgo, not supported")
+				}
+				if !go115 && strings.Contains(t.Name(), "declarecgo") {
+					t.Skip("test requires Go 1.15")
 				}
 				tests.Definition(t, spn, d)
 			})
@@ -808,7 +818,7 @@ func checkData(t *testing.T, data *Data) {
 	}))
 	got := buf.String()
 	if want != got {
-		t.Errorf("test summary does not match, want\n%s\ngot:\n%s", want, got)
+		t.Errorf("test summary does not match: %v", Diff(want, got))
 	}
 }
 
@@ -907,7 +917,7 @@ func (data *Data) collectCodeLens(spn span.Span, title, cmd string) {
 
 func (data *Data) collectDiagnostics(spn span.Span, msgSource, msg, msgSeverity string) {
 	if _, ok := data.Diagnostics[spn.URI()]; !ok {
-		data.Diagnostics[spn.URI()] = []source.Diagnostic{}
+		data.Diagnostics[spn.URI()] = []*source.Diagnostic{}
 	}
 	m, err := data.Mapper(spn.URI())
 	if err != nil {
@@ -929,7 +939,7 @@ func (data *Data) collectDiagnostics(spn span.Span, msgSource, msg, msgSeverity 
 		severity = protocol.SeverityInformation
 	}
 	// This is not the correct way to do this, but it seems excessive to do the full conversion here.
-	want := source.Diagnostic{
+	want := &source.Diagnostic{
 		Range:    rng,
 		Severity: severity,
 		Source:   msgSource,
@@ -1076,7 +1086,8 @@ func (data *Data) collectPrepareRenames(src span.Span, rng span.Range, placehold
 	}
 }
 
-func (data *Data) collectSymbols(name string, spn span.Span, kind string, parentName string) {
+// collectSymbols is responsible for collecting @symbol annotations.
+func (data *Data) collectSymbols(name string, spn span.Span, kind string, parentName string, siName string) {
 	m, err := data.Mapper(spn.URI())
 	if err != nil {
 		data.t.Fatal(err)
@@ -1098,7 +1109,7 @@ func (data *Data) collectSymbols(name string, spn span.Span, kind string, parent
 
 	// Reuse @symbol in the workspace symbols tests.
 	si := protocol.SymbolInformation{
-		Name: sym.Name,
+		Name: siName,
 		Kind: sym.Kind,
 		Location: protocol.Location{
 			URI:   protocol.URIFromSpanURI(spn.URI()),

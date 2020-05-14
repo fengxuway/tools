@@ -19,10 +19,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 
 	"golang.org/x/tools/go/gcexportdata"
+	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/packagesinternal"
 )
 
@@ -47,6 +49,10 @@ const (
 
 	// NeedCompiledGoFiles adds CompiledGoFiles.
 	NeedCompiledGoFiles
+
+	// TypecheckCgo enables full support for type checking cgo. Requires Go 1.15+.
+	// Has no effect without NeedTypes.
+	TypecheckCgo
 
 	// NeedImports adds Imports. If NeedDeps is not set, the Imports field will contain
 	// "placeholder" Packages with only the ID set.
@@ -126,6 +132,9 @@ type Config struct {
 	//	opt.Env = append(os.Environ(), "GOOS=plan9", "GOARCH=386")
 	//
 	Env []string
+
+	// gocmdRunner guards go command calls from concurrency errors.
+	gocmdRunner *gocommand.Runner
 
 	// BuildFlags is a list of command-line flags to be passed through to
 	// the build system's query tool.
@@ -253,7 +262,7 @@ type Package struct {
 	GoFiles []string
 
 	// CompiledGoFiles lists the absolute file paths of the package's source
-	// files that were presented to the compiler.
+	// files that are suitable for type checking.
 	// This may differ from GoFiles if files are processed before compilation.
 	CompiledGoFiles []string
 
@@ -310,6 +319,12 @@ func init() {
 	}
 	packagesinternal.GetModule = func(p interface{}) *packagesinternal.Module {
 		return p.(*Package).module
+	}
+	packagesinternal.GetGoCmdRunner = func(config interface{}) *gocommand.Runner {
+		return config.(*Config).gocmdRunner
+	}
+	packagesinternal.SetGoCmdRunner = func(config interface{}, runner *gocommand.Runner) {
+		config.(*Config).gocmdRunner = runner
 	}
 }
 
@@ -472,6 +487,9 @@ func newLoader(cfg *Config) *loader {
 	}
 	if ld.Config.Env == nil {
 		ld.Config.Env = os.Environ()
+	}
+	if ld.Config.gocmdRunner == nil {
+		ld.Config.gocmdRunner = &gocommand.Runner{}
 	}
 	if ld.Context == nil {
 		ld.Context = context.Background()
@@ -864,6 +882,19 @@ func (ld *loader) loadPackage(lpkg *loaderPackage) {
 
 		Error: appendError,
 		Sizes: ld.sizes,
+	}
+	if (ld.Mode & TypecheckCgo) != 0 {
+		// TODO: remove this when we stop supporting 1.14.
+		rtc := reflect.ValueOf(tc).Elem()
+		usesCgo := rtc.FieldByName("UsesCgo")
+		if !usesCgo.IsValid() {
+			appendError(Error{
+				Msg:  "TypecheckCgo requires Go 1.15+",
+				Kind: ListError,
+			})
+			return
+		}
+		usesCgo.SetBool(true)
 	}
 	types.NewChecker(tc, ld.Fset, lpkg.Types, lpkg.TypesInfo).Files(lpkg.Syntax)
 

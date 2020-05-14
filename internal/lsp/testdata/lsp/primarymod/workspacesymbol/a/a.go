@@ -1,9 +1,9 @@
 package a
 
-var WorkspaceSymbolVariableA = "a" //@symbol("WorkspaceSymbolVariableA", "WorkspaceSymbolVariableA", "Variable", "")
+var RandomGopherVariableA = "a" //@symbol("RandomGopherVariableA", "RandomGopherVariableA", "Variable", "", "RandomGopherVariableA")
 
-const WorkspaceSymbolConstantA = "a" //@symbol("WorkspaceSymbolConstantA", "WorkspaceSymbolConstantA", "Constant", "")
+const RandomGopherConstantA = "a" //@symbol("RandomGopherConstantA", "RandomGopherConstantA", "Constant", "", "RandomGopherConstantA")
 
 const (
-	workspacesymbolinvariable = iota //@symbol("workspacesymbolinvariable", "workspacesymbolinvariable", "Constant", "")
+	randomgopherinvariable = iota //@symbol("randomgopherinvariable", "randomgopherinvariable", "Constant", "", "randomgopherinvariable")
 )

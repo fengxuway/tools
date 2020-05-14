@@ -1,7 +1,7 @@
 package b
 
-var WorkspaceSymbolVariableB = "b" //@symbol("WorkspaceSymbolVariableB", "WorkspaceSymbolVariableB", "Variable", "")
+var RandomGopherVariableB = "b" //@symbol("RandomGopherVariableB", "RandomGopherVariableB", "Variable", "", "RandomGopherVariableB")
 
-type WorkspaceSymbolStructB struct { //@symbol("WorkspaceSymbolStructB", "WorkspaceSymbolStructB", "Struct", "")
-	Bar int //@mark(bBar, "Bar"), symbol("Bar", "Bar", "Field", "WorkspaceSymbolStructB")
+type RandomGopherStructB struct { //@symbol("RandomGopherStructB", "RandomGopherStructB", "Struct", "", "RandomGopherStructB")
+	Bar int //@mark(bBar, "Bar"), symbol("Bar", "Bar", "Field", "RandomGopherStructB", "Bar")
 }

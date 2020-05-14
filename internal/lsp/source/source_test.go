@@ -17,6 +17,7 @@ import (
 	"golang.org/x/tools/go/packages/packagestest"
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/diff"
+	"golang.org/x/tools/internal/lsp/diff/myers"
 	"golang.org/x/tools/internal/lsp/fuzzy"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
@@ -88,7 +89,7 @@ func testSource(t *testing.T, exporter packagestest.Exporter) {
 	}
 }
 
-func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []source.Diagnostic) {
+func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []*source.Diagnostic) {
 	snapshot := r.view.Snapshot()
 
 	fileID, got, err := source.FileDiagnostics(r.ctx, snapshot, uri)
@@ -133,6 +134,7 @@ func (r *runner) CompletionSnippet(t *testing.T, src span.Span, expected tests.C
 	_, list := r.callCompletion(t, src, func(opts *source.Options) {
 		opts.Placeholders = placeholders
 		opts.DeepCompletion = true
+		opts.UnimportedCompletion = false
 	})
 	got := tests.FindItem(list, *items[expected.CompletionItem])
 	want := expected.PlainSnippet
@@ -467,7 +469,8 @@ func (r *runner) Import(t *testing.T, spn span.Span) {
 		return []byte(got), nil
 	}))
 	if want != got {
-		t.Errorf("import failed for %s, expected:\n%v\ngot:\n%v", spn.URI().Filename(), want, got)
+		d := myers.ComputeEdits(spn.URI(), want, got)
+		t.Errorf("import failed for %s: %s", spn.URI().Filename(), diff.ToUnified("want", "got", want, d))
 	}
 }
 
@@ -802,37 +805,23 @@ func (r *runner) Symbols(t *testing.T, uri span.URI, expectedSymbols []protocol.
 }
 
 func (r *runner) WorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	got := r.callWorkspaceSymbols(t, query, func(opts *source.Options) {
-		opts.Matcher = source.CaseInsensitive
-	})
-	got = tests.FilterWorkspaceSymbols(got, dirs)
-	if len(got) != len(expectedSymbols) {
-		t.Errorf("want %d symbols, got %d", len(expectedSymbols), len(got))
-		return
-	}
-	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
-		t.Error(diff)
-	}
+	r.callWorkspaceSymbols(t, query, source.SymbolCaseInsensitive, dirs, expectedSymbols)
 }
 
 func (r *runner) FuzzyWorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	got := r.callWorkspaceSymbols(t, query, func(opts *source.Options) {
-		opts.Matcher = source.Fuzzy
-	})
-	got = tests.FilterWorkspaceSymbols(got, dirs)
-	if len(got) != len(expectedSymbols) {
-		t.Errorf("want %d symbols, got %d", len(expectedSymbols), len(got))
-		return
-	}
-	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
-		t.Error(diff)
-	}
+	r.callWorkspaceSymbols(t, query, source.SymbolFuzzy, dirs, expectedSymbols)
 }
 
 func (r *runner) CaseSensitiveWorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	got := r.callWorkspaceSymbols(t, query, func(opts *source.Options) {
-		opts.Matcher = source.CaseSensitive
-	})
+	r.callWorkspaceSymbols(t, query, source.SymbolCaseSensitive, dirs, expectedSymbols)
+}
+
+func (r *runner) callWorkspaceSymbols(t *testing.T, query string, matcher source.SymbolMatcher, dirs map[string]struct{}, expectedSymbols []protocol.SymbolInformation) {
+	t.Helper()
+	got, err := source.WorkspaceSymbols(r.ctx, matcher, []source.View{r.view}, query)
+	if err != nil {
+		t.Fatal(err)
+	}
 	got = tests.FilterWorkspaceSymbols(got, dirs)
 	if len(got) != len(expectedSymbols) {
 		t.Errorf("want %d symbols, got %d", len(expectedSymbols), len(got))
@@ -841,25 +830,6 @@ func (r *runner) CaseSensitiveWorkspaceSymbols(t *testing.T, query string, expec
 	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
 		t.Error(diff)
 	}
-}
-
-func (r *runner) callWorkspaceSymbols(t *testing.T, query string, options func(*source.Options)) []protocol.SymbolInformation {
-	t.Helper()
-
-	original := r.view.Options()
-	modified := original
-	options(&modified)
-	view, err := r.view.SetOptions(r.ctx, modified)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.view.SetOptions(r.ctx, original)
-
-	got, err := source.WorkspaceSymbols(r.ctx, []source.View{view}, query)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return got
 }
 
 func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.SignatureHelp) {

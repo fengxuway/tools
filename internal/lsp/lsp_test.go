@@ -18,6 +18,7 @@ import (
 	"golang.org/x/tools/go/packages/packagestest"
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/diff"
+	"golang.org/x/tools/internal/lsp/diff/myers"
 	"golang.org/x/tools/internal/lsp/mod"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
@@ -38,7 +39,7 @@ func TestLSP(t *testing.T) {
 type runner struct {
 	server      *Server
 	data        *tests.Data
-	diagnostics map[span.URI][]source.Diagnostic
+	diagnostics map[span.URI][]*source.Diagnostic
 	ctx         context.Context
 }
 
@@ -119,13 +120,13 @@ func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens) 
 	}
 }
 
-func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []source.Diagnostic) {
+func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []*source.Diagnostic) {
 	// Get the diagnostics for this view if we have not done it before.
 	if r.diagnostics == nil {
-		r.diagnostics = make(map[span.URI][]source.Diagnostic)
+		r.diagnostics = make(map[span.URI][]*source.Diagnostic)
 		v := r.server.session.View(r.data.Config.Dir)
 		// Always run diagnostics with analysis.
-		reports := r.server.diagnose(r.ctx, v.Snapshot(), true)
+		reports, _ := r.server.diagnose(r.ctx, v.Snapshot(), true)
 		for key, diags := range reports {
 			r.diagnostics[key.id.URI] = diags
 		}
@@ -363,7 +364,8 @@ func (r *runner) Import(t *testing.T, spn span.Span) {
 		return []byte(got), nil
 	}))
 	if want != got {
-		t.Errorf("import failed for %s, expected:\n%v\ngot:\n%v", filename, want, got)
+		d := myers.ComputeEdits(uri, want, got)
+		t.Errorf("import failed for %s: %s", filename, diff.ToUnified("want", "got", want, d))
 	}
 }
 
@@ -383,9 +385,9 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 	}
 	// Get the diagnostics for this view if we have not done it before.
 	if r.diagnostics == nil {
-		r.diagnostics = make(map[span.URI][]source.Diagnostic)
+		r.diagnostics = make(map[span.URI][]*source.Diagnostic)
 		// Always run diagnostics with analysis.
-		reports := r.server.diagnose(r.ctx, view.Snapshot(), true)
+		reports, _ := r.server.diagnose(r.ctx, view.Snapshot(), true)
 		for key, diags := range reports {
 			r.diagnostics[key.id.URI] = diags
 		}
@@ -396,7 +398,7 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 		// some diagnostics have a range with the same start and end position (8:1-8:1).
 		// The current marker functionality prevents us from having a range of 0 length.
 		if protocol.ComparePosition(d.Range.Start, rng.Start) == 0 {
-			diag = &d
+			diag = d
 			break
 		}
 	}
@@ -413,7 +415,7 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 		},
 		Context: protocol.CodeActionContext{
 			Only:        codeActionKinds,
-			Diagnostics: toProtocolDiagnostics([]source.Diagnostic{*diag}),
+			Diagnostics: toProtocolDiagnostics([]*source.Diagnostic{diag}),
 		},
 	})
 	if err != nil {
@@ -484,7 +486,7 @@ func (r *runner) Definition(t *testing.T, spn span.Span, d tests.Definition) {
 			return []byte(hover.Contents.Value), nil
 		}))
 		if hover.Contents.Value != expectHover {
-			t.Errorf("for %v got %q want %q", d.Src, hover.Contents.Value, expectHover)
+			t.Errorf("%s:\n%s", d.Src, tests.Diff(expectHover, hover.Contents.Value))
 		}
 	}
 	if !d.OnlyHover {
@@ -818,71 +820,41 @@ func (r *runner) Symbols(t *testing.T, uri span.URI, expectedSymbols []protocol.
 }
 
 func (r *runner) WorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	got := r.callWorkspaceSymbols(t, query, func(opts *source.Options) {
-		opts.Matcher = source.CaseInsensitive
-	})
-	got = tests.FilterWorkspaceSymbols(got, dirs)
-	if len(got) != len(expectedSymbols) {
-		t.Errorf("want %d symbols, got %d", len(expectedSymbols), len(got))
-		return
-	}
-	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
-		t.Error(diff)
-	}
+	r.callWorkspaceSymbols(t, query, source.SymbolCaseInsensitive, dirs, expectedSymbols)
 }
 
 func (r *runner) FuzzyWorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	got := r.callWorkspaceSymbols(t, query, func(opts *source.Options) {
-		opts.Matcher = source.Fuzzy
-	})
-	got = tests.FilterWorkspaceSymbols(got, dirs)
-	if len(got) != len(expectedSymbols) {
-		t.Errorf("want %d symbols, got %d", len(expectedSymbols), len(got))
-		return
-	}
-	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
-		t.Error(diff)
-	}
+	r.callWorkspaceSymbols(t, query, source.SymbolFuzzy, dirs, expectedSymbols)
 }
 
 func (r *runner) CaseSensitiveWorkspaceSymbols(t *testing.T, query string, expectedSymbols []protocol.SymbolInformation, dirs map[string]struct{}) {
-	got := r.callWorkspaceSymbols(t, query, func(opts *source.Options) {
-		opts.Matcher = source.CaseSensitive
-	})
-	got = tests.FilterWorkspaceSymbols(got, dirs)
-	if len(got) != len(expectedSymbols) {
-		t.Errorf("want %d symbols, got %d", len(expectedSymbols), len(got))
-		return
-	}
-	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
-		t.Error(diff)
-	}
+	r.callWorkspaceSymbols(t, query, source.SymbolCaseSensitive, dirs, expectedSymbols)
 }
 
-func (r *runner) callWorkspaceSymbols(t *testing.T, query string, options func(*source.Options)) []protocol.SymbolInformation {
+func (r *runner) callWorkspaceSymbols(t *testing.T, query string, matcher source.SymbolMatcher, dirs map[string]struct{}, expectedSymbols []protocol.SymbolInformation) {
 	t.Helper()
 
-	for _, view := range r.server.session.Views() {
-		original := view.Options()
-		modified := original
-		options(&modified)
-		var err error
-		view, err = view.SetOptions(r.ctx, modified)
-		if err != nil {
-			t.Error(err)
-			return nil
-		}
-		defer view.SetOptions(r.ctx, original)
-	}
+	original := r.server.session.Options()
+	modified := original
+	modified.SymbolMatcher = matcher
+	r.server.session.SetOptions(modified)
+	defer r.server.session.SetOptions(original)
 
 	params := &protocol.WorkspaceSymbolParams{
 		Query: query,
 	}
-	symbols, err := r.server.Symbol(r.ctx, params)
+	got, err := r.server.Symbol(r.ctx, params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return symbols
+	got = tests.FilterWorkspaceSymbols(got, dirs)
+	if len(got) != len(expectedSymbols) {
+		t.Errorf("want %d symbols, got %d", len(expectedSymbols), len(got))
+		return
+	}
+	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
+		t.Error(diff)
+	}
 }
 
 func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.SignatureHelp) {

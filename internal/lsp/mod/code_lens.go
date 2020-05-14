@@ -6,14 +6,18 @@ import (
 	"strings"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
-	"golang.org/x/tools/internal/telemetry/event"
 )
 
+// CodeLens computes code lens for a go.mod file.
 func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]protocol.CodeLens, error) {
+	if !snapshot.View().Options().EnabledCodeLens[source.CommandUpgradeDependency] {
+		return nil, nil
+	}
 	realURI, _ := snapshot.View().ModFiles()
 	if realURI == "" {
 		return nil, nil
@@ -22,7 +26,7 @@ func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]pr
 	if uri != realURI {
 		return nil, nil
 	}
-	ctx, done := event.StartSpan(ctx, "mod.CodeLens", tag.URI.Of(realURI))
+	ctx, done := event.Start(ctx, "mod.CodeLens", tag.URI.Of(realURI))
 	defer done()
 
 	fh, err := snapshot.GetFile(realURI)
@@ -50,7 +54,7 @@ func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]pr
 			Range: rng,
 			Command: protocol.Command{
 				Title:     fmt.Sprintf("Upgrade dependency to %s", latest),
-				Command:   "upgrade.dependency",
+				Command:   source.CommandUpgradeDependency,
 				Arguments: []interface{}{uri, dep},
 			},
 		})
@@ -67,7 +71,7 @@ func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]pr
 			Range: rng,
 			Command: protocol.Command{
 				Title:     "Upgrade all dependencies",
-				Command:   "upgrade.dependency",
+				Command:   source.CommandUpgradeDependency,
 				Arguments: []interface{}{uri, strings.Join(append([]string{"-u"}, allUpgrades...), " ")},
 			},
 		})

@@ -1584,12 +1584,12 @@ func testContainsOverlayXTest(t *testing.T, exporter packagestest.Exporter) {
 // This test ensures that the effective GOARCH variable in the
 // application determines the Sizes function used by the type checker.
 // This behavior is a stop-gap until we make the build system's query
-// too report the correct sizes function for the actual configuration.
+// tool report the correct sizes function for the actual configuration.
 func TestSizes(t *testing.T) { packagestest.TestAll(t, testSizes) }
 func testSizes(t *testing.T, exporter packagestest.Exporter) {
 	// Only run this test on operating systems that have both an amd64 and 386 port.
 	switch runtime.GOOS {
-	case "darwin", "linux", "windows", "freebsd", "openbsd", "android":
+	case "linux", "windows", "freebsd", "openbsd", "netbsd", "android":
 	default:
 		t.Skipf("skipping test on %s", runtime.GOOS)
 	}
@@ -2767,4 +2767,26 @@ func copyAll(srcPath, dstPath string) error {
 		}
 		return nil
 	})
+}
+
+// Stolen from internal/testenv package in core.
+// hasGoBuild reports whether the current system can build programs with ``go build''
+// and then run them with os.StartProcess or exec.Command.
+func hasGoBuild() bool {
+	if os.Getenv("GO_GCFLAGS") != "" {
+		// It's too much work to require every caller of the go command
+		// to pass along "-gcflags="+os.Getenv("GO_GCFLAGS").
+		// For now, if $GO_GCFLAGS is set, report that we simply can't
+		// run go build.
+		return false
+	}
+	switch runtime.GOOS {
+	case "android", "js":
+		return false
+	case "darwin":
+		if strings.HasPrefix(runtime.GOARCH, "arm") {
+			return false
+		}
+	}
+	return true
 }

@@ -9,18 +9,21 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/packagesinternal"
 	"golang.org/x/tools/internal/span"
-	"golang.org/x/tools/internal/telemetry/event"
 	errors "golang.org/x/xerrors"
 )
 
@@ -94,7 +97,7 @@ func (s *snapshot) Config(ctx context.Context) *packages.Config {
 	verboseOutput := s.view.options.VerboseOutput
 	s.view.optionsMu.Unlock()
 
-	return &packages.Config{
+	cfg := &packages.Config{
 		Env:        env,
 		Dir:        s.view.folder.Filename(),
 		Context:    ctx,
@@ -112,11 +115,18 @@ func (s *snapshot) Config(ctx context.Context) *packages.Config {
 		},
 		Logf: func(format string, args ...interface{}) {
 			if verboseOutput {
-				event.Print(ctx, fmt.Sprintf(format, args...))
+				event.Log(ctx, fmt.Sprintf(format, args...))
 			}
 		},
 		Tests: true,
 	}
+	// We want to type check cgo code if go/types supports it.
+	if reflect.ValueOf(&types.Config{}).Elem().FieldByName("UsesCgo").IsValid() {
+		cfg.Mode |= packages.TypecheckCgo
+	}
+	packagesinternal.SetGoCmdRunner(cfg, s.view.gocmdRunner)
+
+	return cfg
 }
 
 func (s *snapshot) buildOverlay() map[string][]byte {
@@ -287,17 +297,17 @@ func (s *snapshot) rebuildImportGraph() {
 	}
 }
 
-func (s *snapshot) addPackage(ph *packageHandle) {
+func (s *snapshot) addPackageHandle(ph *packageHandle) *packageHandle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// TODO: We should make sure not to compute duplicate packageHandles,
-	// and instead panic here. This will be hard to do because we may encounter
-	// the same package multiple times in the dependency tree.
-	if _, ok := s.packages[ph.packageKey()]; ok {
-		return
+	// If the package handle has already been cached,
+	// return the cached handle instead of overriding it.
+	if ph, ok := s.packages[ph.packageKey()]; ok {
+		return ph
 	}
 	s.packages[ph.packageKey()] = ph
+	return ph
 }
 
 func (s *snapshot) workspacePackageIDs() (ids []packageID) {
@@ -423,7 +433,7 @@ func (s *snapshot) getActionHandle(id packageID, m source.ParseMode, a *analysis
 	return s.actions[key]
 }
 
-func (s *snapshot) addActionHandle(ah *actionHandle) {
+func (s *snapshot) addActionHandle(ah *actionHandle) *actionHandle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -434,10 +444,11 @@ func (s *snapshot) addActionHandle(ah *actionHandle) {
 			mode: ah.pkg.mode,
 		},
 	}
-	if _, ok := s.actions[key]; ok {
-		return
+	if ah, ok := s.actions[key]; ok {
+		return ah
 	}
 	s.actions[key] = ah
+	return ah
 }
 
 func (s *snapshot) getIDsForURI(uri span.URI) []packageID {
@@ -495,6 +506,17 @@ func (s *snapshot) isWorkspacePackage(id packageID) (packagePath, bool) {
 
 	scope, ok := s.workspacePackages[id]
 	return scope, ok
+}
+func (s *snapshot) FindFile(uri span.URI) source.FileHandle {
+	f, err := s.view.getFile(uri)
+	if err != nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.files[f.URI()]
 }
 
 // GetFile returns a File for the given URI. It will always succeed because it
