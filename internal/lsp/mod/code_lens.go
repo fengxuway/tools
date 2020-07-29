@@ -3,7 +3,6 @@ package mod
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/internal/event"
@@ -15,31 +14,41 @@ import (
 
 // CodeLens computes code lens for a go.mod file.
 func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]protocol.CodeLens, error) {
-	if !snapshot.View().Options().EnabledCodeLens[source.CommandUpgradeDependency] {
+	if !snapshot.View().Options().EnabledCodeLens[source.CommandUpgradeDependency.Name] {
 		return nil, nil
 	}
-	realURI, _ := snapshot.View().ModFiles()
-	if realURI == "" {
-		return nil, nil
-	}
-	// Only get code lens on the go.mod for the view.
-	if uri != realURI {
-		return nil, nil
-	}
-	ctx, done := event.Start(ctx, "mod.CodeLens", tag.URI.Of(realURI))
+	ctx, done := event.Start(ctx, "mod.CodeLens", tag.URI.Of(uri))
 	defer done()
 
-	fh, err := snapshot.GetFile(realURI)
+	// Only show go.mod code lenses in module mode, for the view's go.mod.
+	if modURI := snapshot.View().ModFile(); modURI == "" || modURI != uri {
+		return nil, nil
+	}
+	fh, err := snapshot.GetFile(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
-	f, m, upgrades, err := snapshot.ModHandle(ctx, fh).Upgrades(ctx)
+	pmh, err := snapshot.ParseModHandle(ctx, fh)
 	if err != nil {
 		return nil, err
 	}
-	var codelens []protocol.CodeLens
-	var allUpgrades []string
-	for _, req := range f.Require {
+	file, m, _, err := pmh.Parse(ctx, snapshot)
+	if err != nil {
+		return nil, err
+	}
+	muh, err := snapshot.ModUpgradeHandle(ctx)
+	if err != nil {
+		return nil, err
+	}
+	upgrades, err := muh.Upgrades(ctx, snapshot)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		codelens    []protocol.CodeLens
+		allUpgrades []string
+	)
+	for _, req := range file.Require {
 		dep := req.Mod.Path
 		latest, ok := upgrades[dep]
 		if !ok {
@@ -50,20 +59,28 @@ func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]pr
 		if err != nil {
 			return nil, err
 		}
+		jsonArgs, err := source.MarshalArgs(uri, []string{dep})
+		if err != nil {
+			return nil, err
+		}
 		codelens = append(codelens, protocol.CodeLens{
 			Range: rng,
 			Command: protocol.Command{
 				Title:     fmt.Sprintf("Upgrade dependency to %s", latest),
-				Command:   source.CommandUpgradeDependency,
-				Arguments: []interface{}{uri, dep},
+				Command:   source.CommandUpgradeDependency.Name,
+				Arguments: jsonArgs,
 			},
 		})
 		allUpgrades = append(allUpgrades, dep)
 	}
 	// If there is at least 1 upgrade, add an "Upgrade all dependencies" to the module statement.
-	if module := f.Module; len(allUpgrades) > 0 && module != nil && module.Syntax != nil {
+	if module := file.Module; len(allUpgrades) > 0 && module != nil && module.Syntax != nil {
 		// Get the range of the module directive.
 		rng, err := positionsToRange(uri, m, module.Syntax.Start, module.Syntax.End)
+		if err != nil {
+			return nil, err
+		}
+		jsonArgs, err := source.MarshalArgs(uri, append([]string{"-u"}, allUpgrades...))
 		if err != nil {
 			return nil, err
 		}
@@ -71,8 +88,8 @@ func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]pr
 			Range: rng,
 			Command: protocol.Command{
 				Title:     "Upgrade all dependencies",
-				Command:   source.CommandUpgradeDependency,
-				Arguments: []interface{}{uri, strings.Join(append([]string{"-u"}, allUpgrades...), " ")},
+				Command:   source.CommandUpgradeDependency.Name,
+				Arguments: jsonArgs,
 			},
 		})
 	}

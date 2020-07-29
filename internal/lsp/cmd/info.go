@@ -32,7 +32,7 @@ func (v *version) DetailedHelp(f *flag.FlagSet) {
 
 // Run prints version information to stdout.
 func (v *version) Run(ctx context.Context, args ...string) error {
-	debug.PrintVersionInfo(ctx, os.Stdout, v.app.Verbose, debug.PlainText)
+	debug.PrintVersionInfo(ctx, os.Stdout, v.app.verbose(), debug.PlainText)
 	return nil
 }
 
@@ -47,8 +47,8 @@ func (b *bug) DetailedHelp(f *flag.FlagSet) {
 	f.PrintDefaults()
 }
 
-const goplsBugPrefix = "x/tools/gopls: "
-const goplsBugHeader = `Please answer these questions before submitting your issue. Thanks!
+const goplsBugPrefix = "x/tools/gopls: <DESCRIBE THE PROBLEM>"
+const goplsBugHeader = `ATTENTION: Please answer these questions BEFORE submitting your issue. Thanks!
 
 #### What did you do?
 If possible, provide a recipe for reproducing the error.

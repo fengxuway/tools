@@ -2,6 +2,8 @@ package regtest
 
 import (
 	"testing"
+
+	"golang.org/x/tools/internal/lsp/tests"
 )
 
 const unformattedProgram = `
@@ -28,13 +30,14 @@ func TestFormatting(t *testing.T) {
 		got := env.Editor.BufferText("main.go")
 		want := env.ReadWorkspaceFile("main.go.golden")
 		if got != want {
-			t.Errorf("\n## got formatted file:\n%s\n## want:\n%s", got, want)
+			t.Errorf("unexpected formatting result:\n%s", tests.Diff(want, got))
 		}
 	})
 }
 
-// this is the fixed case from #36824
-const onelineProgram = `
+// Tests golang/go#36824.
+func TestFormattingOneLine36824(t *testing.T) {
+	const onelineProgram = `
 -- a.go --
 package main; func f() {}
 
@@ -43,20 +46,20 @@ package main
 
 func f() {}
 `
-
-func TestFormattingOneLine36824(t *testing.T) {
 	runner.Run(t, onelineProgram, func(t *testing.T, env *Env) {
 		env.OpenFile("a.go")
 		env.FormatBuffer("a.go")
 		got := env.Editor.BufferText("a.go")
 		want := env.ReadWorkspaceFile("a.go.formatted")
 		if got != want {
-			t.Errorf("got\n%q wanted\n%q", got, want)
+			t.Errorf("unexpected formatting result:\n%s", tests.Diff(want, got))
 		}
 	})
 }
 
-const onelineProgramA = `
+// Tests golang/go#36824.
+func TestFormattingOneLineImports36824(t *testing.T) {
+	const onelineProgramA = `
 -- a.go --
 package x; func f() {fmt.Println()}
 
@@ -67,18 +70,34 @@ import "fmt"
 
 func f() { fmt.Println() }
 `
-
-// this is the example from #36824 done properly
-// but gopls does not reformat before fixing the imports
-func TestFormattingOneLineImports36824(t *testing.T) {
 	runner.Run(t, onelineProgramA, func(t *testing.T, env *Env) {
 		env.OpenFile("a.go")
-		env.FormatBuffer("a.go")
 		env.OrganizeImports("a.go")
 		got := env.Editor.BufferText("a.go")
 		want := env.ReadWorkspaceFile("a.go.imported")
 		if got != want {
-			t.Errorf("OneLineImports go\n%q wanted\n%q", got, want)
+			t.Errorf("unexpected formatting result:\n%s", tests.Diff(want, got))
+		}
+	})
+}
+
+func TestFormattingOneLineRmImports36824(t *testing.T) {
+	const onelineProgramB = `
+-- a.go --
+package x; import "os"; func f() {}
+
+-- a.go.imported --
+package x
+
+func f() {}
+`
+	runner.Run(t, onelineProgramB, func(t *testing.T, env *Env) {
+		env.OpenFile("a.go")
+		env.OrganizeImports("a.go")
+		got := env.Editor.BufferText("a.go")
+		want := env.ReadWorkspaceFile("a.go.imported")
+		if got != want {
+			t.Errorf("unexpected formatting result:\n%s", tests.Diff(want, got))
 		}
 	})
 }
@@ -124,7 +143,7 @@ func TestOrganizeImports(t *testing.T) {
 		got := env.Editor.BufferText("main.go")
 		want := env.ReadWorkspaceFile("main.go.organized")
 		if got != want {
-			t.Errorf("\n## got formatted file:\n%s\n## want:\n%s", got, want)
+			t.Errorf("unexpected formatting result:\n%s", tests.Diff(want, got))
 		}
 	})
 }
@@ -136,7 +155,7 @@ func TestFormattingOnSave(t *testing.T) {
 		got := env.Editor.BufferText("main.go")
 		want := env.ReadWorkspaceFile("main.go.formatted")
 		if got != want {
-			t.Errorf("\n## got formatted file:\n%s\n## want:\n%s", got, want)
+			t.Errorf("unexpected formatting result:\n%s", tests.Diff(want, got))
 		}
 	})
 }

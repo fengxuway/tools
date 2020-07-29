@@ -12,7 +12,6 @@ import (
 	"sync"
 	"testing"
 
-	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/jsonrpc2/servertest"
 	"golang.org/x/tools/internal/lsp/fake"
 	"golang.org/x/tools/internal/lsp/protocol"
@@ -31,7 +30,6 @@ type Env struct {
 	Sandbox *fake.Sandbox
 	Editor  *fake.Editor
 	Server  servertest.Connector
-	Conn    *jsonrpc2.Conn
 
 	// mu guards the fields below, for the purpose of checking conditions on
 	// every change to diagnostics.
@@ -45,9 +43,10 @@ type Env struct {
 // State encapsulates the server state TODO: explain more
 type State struct {
 	// diagnostics are a map of relative path->diagnostics params
-	diagnostics map[string]*protocol.PublishDiagnosticsParams
-	logs        []*protocol.LogMessageParams
-	showMessage []*protocol.ShowMessageParams
+	diagnostics        map[string]*protocol.PublishDiagnosticsParams
+	logs               []*protocol.LogMessageParams
+	showMessage        []*protocol.ShowMessageParams
+	showMessageRequest []*protocol.ShowMessageRequestParams
 	// outstandingWork is a map of token->work summary. All tokens are assumed to
 	// be string, though the spec allows for numeric tokens as well.  When work
 	// completes, it is deleted from this map.
@@ -87,7 +86,11 @@ func (s State) String() string {
 		if name == "" {
 			name = fmt.Sprintf("!NO NAME(token: %s)", token)
 		}
-		fmt.Fprintf(&b, "\t%s: %.2f", name, state.percent)
+		fmt.Fprintf(&b, "\t%s: %.2f\n", name, state.percent)
+	}
+	b.WriteString("#### completed work:\n")
+	for name, count := range s.completedWork {
+		fmt.Fprintf(&b, "\t%s: %d\n", name, count)
 	}
 	return b.String()
 }
@@ -102,15 +105,14 @@ type condition struct {
 
 // NewEnv creates a new test environment using the given scratch environment
 // and gopls server.
-func NewEnv(ctx context.Context, t *testing.T, scratch *fake.Sandbox, ts servertest.Connector, editorConfig fake.EditorConfig) *Env {
+func NewEnv(ctx context.Context, t *testing.T, sandbox *fake.Sandbox, ts servertest.Connector, editorConfig fake.EditorConfig, withHooks bool) *Env {
 	t.Helper()
 	conn := ts.Connect(ctx)
 	env := &Env{
 		T:       t,
 		Ctx:     ctx,
-		Sandbox: scratch,
+		Sandbox: sandbox,
 		Server:  ts,
-		Conn:    conn,
 		state: State{
 			diagnostics:     make(map[string]*protocol.PublishDiagnosticsParams),
 			outstandingWork: make(map[string]*workProgress),
@@ -118,14 +120,18 @@ func NewEnv(ctx context.Context, t *testing.T, scratch *fake.Sandbox, ts servert
 		},
 		waiters: make(map[int]*condition),
 	}
-	hooks := fake.ClientHooks{
-		OnDiagnostics:            env.onDiagnostics,
-		OnLogMessage:             env.onLogMessage,
-		OnWorkDoneProgressCreate: env.onWorkDoneProgressCreate,
-		OnProgress:               env.onProgress,
-		OnShowMessage:            env.onShowMessage,
+	var hooks fake.ClientHooks
+	if withHooks {
+		hooks = fake.ClientHooks{
+			OnDiagnostics:            env.onDiagnostics,
+			OnLogMessage:             env.onLogMessage,
+			OnWorkDoneProgressCreate: env.onWorkDoneProgressCreate,
+			OnProgress:               env.onProgress,
+			OnShowMessage:            env.onShowMessage,
+			OnShowMessageRequest:     env.onShowMessageRequest,
+		}
 	}
-	editor, err := fake.NewEditor(scratch, editorConfig).Connect(ctx, conn, hooks)
+	editor, err := fake.NewEditor(sandbox, editorConfig).Connect(ctx, conn, hooks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +154,15 @@ func (e *Env) onShowMessage(_ context.Context, m *protocol.ShowMessageParams) er
 	defer e.mu.Unlock()
 
 	e.state.showMessage = append(e.state.showMessage, m)
+	e.checkConditionsLocked()
+	return nil
+}
+
+func (e *Env) onShowMessageRequest(_ context.Context, m *protocol.ShowMessageRequestParams) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.state.showMessageRequest = append(e.state.showMessageRequest, m)
 	e.checkConditionsLocked()
 	return nil
 }
@@ -352,17 +367,42 @@ func EmptyShowMessage(title string) SimpleExpectation {
 	}
 }
 
-// SomeShowMessage asserts that the editor has received a ShowMessage.
+// SomeShowMessage asserts that the editor has received a ShowMessage with the given title.
 func SomeShowMessage(title string) SimpleExpectation {
 	check := func(s State) (Verdict, interface{}) {
-		if len(s.showMessage) > 0 {
-			return Met, title
+		for _, m := range s.showMessage {
+			if strings.Contains(m.Message, title) {
+				return Met, m
+			}
 		}
 		return Unmet, nil
 	}
 	return SimpleExpectation{
 		check:       check,
 		description: "received ShowMessage",
+	}
+}
+
+// ShowMessageRequest asserts that the editor has received a ShowMessageRequest
+// with an action item that has the given title.
+func ShowMessageRequest(title string) SimpleExpectation {
+	check := func(s State) (Verdict, interface{}) {
+		if len(s.showMessageRequest) == 0 {
+			return Unmet, nil
+		}
+		// Only check the most recent one.
+		m := s.showMessageRequest[len(s.showMessageRequest)-1]
+		if len(m.Actions) == 0 || len(m.Actions) > 1 {
+			return Unmet, nil
+		}
+		if m.Actions[0].Title == title {
+			return Met, m.Actions[0]
+		}
+		return Unmet, nil
+	}
+	return SimpleExpectation{
+		check:       check,
+		description: "received ShowMessageRequest",
 	}
 }
 
@@ -403,22 +443,11 @@ func (e LogExpectation) Description() string {
 // NoErrorLogs asserts that the client has not received any log messages of
 // error severity.
 func NoErrorLogs() LogExpectation {
-	check := func(msgs []*protocol.LogMessageParams) (Verdict, interface{}) {
-		for _, msg := range msgs {
-			if msg.Type == protocol.Error {
-				return Unmeetable, nil
-			}
-		}
-		return Met, nil
-	}
-	return LogExpectation{
-		check:       check,
-		description: "no errors have been logged",
-	}
+	return NoLogMatching(protocol.Error, "")
 }
 
 // LogMatching asserts that the client has received a log message
-// matching of type typ matching the regexp re.
+// of type typ matching the regexp re.
 func LogMatching(typ protocol.MessageType, re string) LogExpectation {
 	rec, err := regexp.Compile(re)
 	if err != nil {
@@ -435,6 +464,35 @@ func LogMatching(typ protocol.MessageType, re string) LogExpectation {
 	return LogExpectation{
 		check:       check,
 		description: fmt.Sprintf("log message matching %q", re),
+	}
+}
+
+// NoLogMatching asserts that the client has not received a log message
+// of type typ matching the regexp re. If re is an empty string, any log
+// message is considered a match.
+func NoLogMatching(typ protocol.MessageType, re string) LogExpectation {
+	var r *regexp.Regexp
+	if re != "" {
+		var err error
+		r, err = regexp.Compile(re)
+		if err != nil {
+			panic(err)
+		}
+	}
+	check := func(msgs []*protocol.LogMessageParams) (Verdict, interface{}) {
+		for _, msg := range msgs {
+			if msg.Type != typ {
+				continue
+			}
+			if r == nil || r.Match([]byte(msg.Message)) {
+				return Unmeetable, nil
+			}
+		}
+		return Met, nil
+	}
+	return LogExpectation{
+		check:       check,
+		description: fmt.Sprintf("no log message matching %q", re),
 	}
 }
 
@@ -514,6 +572,7 @@ func (e *Env) AnyDiagnosticAtCurrentVersion(name string) DiagnosticExpectation {
 // position matching the regexp search string re in the buffer specified by
 // name. Note that this currently ignores the end position.
 func (e *Env) DiagnosticAtRegexp(name, re string) DiagnosticExpectation {
+	e.T.Helper()
 	pos := e.RegexpSearch(name, re)
 	expectation := DiagnosticAt(name, pos.Line, pos.Column)
 	expectation.description += fmt.Sprintf(" (location of %q)", re)
@@ -536,6 +595,15 @@ func DiagnosticAt(name string, line, col int) DiagnosticExpectation {
 		description: fmt.Sprintf("diagnostic at {line:%d, column:%d}", line, col),
 		path:        name,
 	}
+}
+
+// DiagnosticsFor returns the current diagnostics for the file. It is useful
+// after waiting on AnyDiagnosticAtCurrentVersion, when the desired diagnostic
+// is not simply described by DiagnosticAt.
+func (e *Env) DiagnosticsFor(name string) *protocol.PublishDiagnosticsParams {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.state.diagnostics[name]
 }
 
 // Await waits for all expectations to simultaneously be met. It should only be

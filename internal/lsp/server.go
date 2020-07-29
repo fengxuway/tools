@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"golang.org/x/tools/internal/jsonrpc2"
-	"golang.org/x/tools/internal/lsp/mod"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
@@ -24,10 +23,11 @@ const concurrentAnalyses = 1
 // messages on on the supplied stream.
 func NewServer(session source.Session, client protocol.Client) *Server {
 	return &Server{
-		delivered:       make(map[span.URI]sentDiagnostics),
-		session:         session,
-		client:          client,
-		diagnosticsSema: make(chan struct{}, concurrentAnalyses),
+		delivered:            make(map[span.URI]sentDiagnostics),
+		gcOptimizatonDetails: make(map[span.URI]bool),
+		session:              session,
+		client:               client,
+		diagnosticsSema:      make(chan struct{}, concurrentAnalyses),
 	}
 }
 
@@ -74,6 +74,10 @@ type Server struct {
 	deliveredMu sync.Mutex
 	delivered   map[span.URI]sentDiagnostics
 
+	// gcOptimizationDetails describes which packages we want optimization details
+	// included in the diagnostics. The key is the directory of the package.
+	gcOptimizatonDetails map[span.URI]bool
+
 	// diagnosticsSema limits the concurrency of diagnostics runs, which can be expensive.
 	diagnosticsSema chan struct{}
 
@@ -93,36 +97,21 @@ type sentDiagnostics struct {
 	snapshotID   uint64
 }
 
-func (s *Server) codeLens(ctx context.Context, params *protocol.CodeLensParams) ([]protocol.CodeLens, error) {
-	snapshot, fh, ok, err := s.beginFileRequest(params.TextDocument.URI, source.UnknownKind)
-	if !ok {
-		return nil, err
-	}
-	switch fh.Identity().Kind {
-	case source.Mod:
-		return mod.CodeLens(ctx, snapshot, fh.Identity().URI)
-	case source.Go:
-		return source.CodeLens(ctx, snapshot, fh)
-	}
-	// Unsupported file kind for a code action.
-	return nil, nil
-}
-
 func (s *Server) nonstandardRequest(ctx context.Context, method string, params interface{}) (interface{}, error) {
 	paramMap := params.(map[string]interface{})
 	if method == "gopls/diagnoseFiles" {
 		for _, file := range paramMap["files"].([]interface{}) {
-			snapshot, fh, ok, err := s.beginFileRequest(protocol.DocumentURI(file.(string)), source.UnknownKind)
+			snapshot, fh, ok, err := s.beginFileRequest(ctx, protocol.DocumentURI(file.(string)), source.UnknownKind)
 			if !ok {
 				return nil, err
 			}
 
-			fileID, diagnostics, err := source.FileDiagnostics(ctx, snapshot, fh.Identity().URI)
+			fileID, diagnostics, err := source.FileDiagnostics(ctx, snapshot, fh.URI())
 			if err != nil {
 				return nil, err
 			}
 			if err := s.client.PublishDiagnostics(ctx, &protocol.PublishDiagnosticsParams{
-				URI:         protocol.URIFromSpanURI(fh.Identity().URI),
+				URI:         protocol.URIFromSpanURI(fh.URI()),
 				Diagnostics: toProtocolDiagnostics(diagnostics),
 				Version:     fileID.Version,
 			}); err != nil {

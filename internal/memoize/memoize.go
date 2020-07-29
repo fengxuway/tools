@@ -32,9 +32,13 @@ type Store struct {
 	entries map[interface{}]uintptr
 }
 
+// Arg is a marker interface that can be embedded to indicate a type is
+// intended for use as a Function argument.
+type Arg interface{ memoizeArg() }
+
 // Function is the type for functions that can be memoized.
 // The result must be a pointer.
-type Function func(ctx context.Context) interface{}
+type Function func(ctx context.Context, arg Arg) interface{}
 
 type state int
 
@@ -164,6 +168,27 @@ func (s *Store) Stats() map[reflect.Type]int {
 	return result
 }
 
+// DebugOnlyIterate iterates through all live cache entries and calls f on them.
+// It should only be used for debugging purposes.
+func (s *Store) DebugOnlyIterate(f func(k, v interface{})) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for k, e := range s.entries {
+		h := (*Handle)(unsafe.Pointer(e))
+		var v interface{}
+		h.mu.Lock()
+		if h.state == stateCompleted {
+			v = h.value
+		}
+		h.mu.Unlock()
+		if v == nil {
+			continue
+		}
+		f(k, v)
+	}
+}
+
 // Cached returns the value associated with a handle.
 //
 // It will never cause the value to be generated.
@@ -182,26 +207,26 @@ func (h *Handle) Cached() interface{} {
 // If the value is not yet ready, the underlying function will be invoked.
 // This activates the handle, and it will remember the value for as long as it exists.
 // If ctx is cancelled, Get returns nil.
-func (h *Handle) Get(ctx context.Context) interface{} {
+func (h *Handle) Get(ctx context.Context, arg Arg) (interface{}, error) {
 	if ctx.Err() != nil {
-		return nil
+		return nil, ctx.Err()
 	}
 	h.mu.Lock()
 	switch h.state {
 	case stateIdle:
-		return h.run(ctx)
+		return h.run(ctx, arg)
 	case stateRunning:
 		return h.wait(ctx)
 	case stateCompleted:
 		defer h.mu.Unlock()
-		return h.value
+		return h.value, nil
 	default:
 		panic("unknown state")
 	}
 }
 
 // run starts h.function and returns the result. h.mu must be locked.
-func (h *Handle) run(ctx context.Context) interface{} {
+func (h *Handle) run(ctx context.Context, arg Arg) (interface{}, error) {
 	childCtx, cancel := context.WithCancel(xcontext.Detach(ctx))
 	h.cancel = cancel
 	h.state = stateRunning
@@ -213,7 +238,7 @@ func (h *Handle) run(ctx context.Context) interface{} {
 		if childCtx.Err() != nil {
 			return
 		}
-		v := function(childCtx)
+		v := function(childCtx, arg)
 		if childCtx.Err() != nil {
 			return
 		}
@@ -237,7 +262,7 @@ func (h *Handle) run(ctx context.Context) interface{} {
 }
 
 // wait waits for the value to be computed, or ctx to be cancelled. h.mu must be locked.
-func (h *Handle) wait(ctx context.Context) interface{} {
+func (h *Handle) wait(ctx context.Context) (interface{}, error) {
 	h.waiters++
 	done := h.done
 	h.mu.Unlock()
@@ -247,9 +272,9 @@ func (h *Handle) wait(ctx context.Context) interface{} {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.state == stateCompleted {
-			return h.value
+			return h.value, nil
 		}
-		return nil
+		return nil, nil
 	case <-ctx.Done():
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -261,7 +286,7 @@ func (h *Handle) wait(ctx context.Context) interface{} {
 			h.done = nil
 			h.cancel = nil
 		}
-		return nil
+		return nil, ctx.Err()
 	}
 }
 

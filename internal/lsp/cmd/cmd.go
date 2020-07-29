@@ -57,18 +57,25 @@ type Application struct {
 	// The environment variables to use.
 	env []string
 
-	// Support for remote lsp server
+	// Support for remote LSP server.
 	Remote string `flag:"remote" help:"forward all commands to a remote lsp specified by this flag. With no special prefix, this is assumed to be a TCP address. If prefixed by 'unix;', the subsequent address is assumed to be a unix domain socket. If 'auto', or prefixed by 'auto;', the remote address is automatically resolved based on the executing environment."`
 
-	// Enable verbose logging
+	// Verbose enables verbose logging.
 	Verbose bool `flag:"v" help:"verbose output"`
 
+	// VeryVerbose enables a higher level of verbosity in logging output.
+	VeryVerbose bool `flag:"vv" help:"very verbose output"`
+
 	// Control ocagent export of telemetry
-	OCAgent string `flag:"ocagent" help:"the address of the ocagent, or off"`
+	OCAgent string `flag:"ocagent" help:"the address of the ocagent (e.g. http://localhost:55678), or off"`
 
 	// PrepareOptions is called to update the options when a new view is built.
 	// It is primarily to allow the behavior of gopls to be modified by hooks.
 	PrepareOptions func(*source.Options)
+}
+
+func (app *Application) verbose() bool {
+	return app.Verbose || app.VeryVerbose
 }
 
 // New returns a new Application ready to run.
@@ -85,7 +92,6 @@ func New(name, wd string, env []string, options func(*source.Options)) *Applicat
 
 		Serve: Serve{
 			RemoteListenTimeout: 1 * time.Minute,
-			RemoteLogfile:       "auto",
 		},
 	}
 	return app
@@ -182,7 +188,7 @@ func (app *Application) featureCommands() []tool.Application {
 		&references{app: app},
 		&rename{app: app},
 		&signature{app: app},
-		&suggestedfix{app: app},
+		&suggestedFix{app: app},
 		&symbols{app: app},
 		&workspaceSymbol{app: app},
 	}
@@ -224,17 +230,26 @@ func (app *Application) connect(ctx context.Context) (*connection, error) {
 	}
 }
 
+// CloseTestConnections terminates shared connections used in command tests. It
+// should only be called from tests.
+func CloseTestConnections(ctx context.Context) {
+	for _, c := range internalConnections {
+		c.Shutdown(ctx)
+		c.Exit(ctx)
+	}
+}
+
 func (app *Application) connectRemote(ctx context.Context, remote string) (*connection, error) {
 	connection := newConnection(app)
 	conn, err := net.Dial("tcp", remote)
 	if err != nil {
 		return nil, err
 	}
-	stream := jsonrpc2.NewHeaderStream(conn, conn)
+	stream := jsonrpc2.NewHeaderStream(conn)
 	cc := jsonrpc2.NewConn(stream)
 	connection.Server = protocol.ServerDispatcher(cc)
 	ctx = protocol.WithClient(ctx, connection.Client)
-	go cc.Run(ctx,
+	cc.Go(ctx,
 		protocol.Handlers(
 			protocol.ClientHandler(connection.Client,
 				jsonrpc2.MethodNotFound)))
@@ -330,15 +345,15 @@ func (c *cmdClient) LogMessage(ctx context.Context, p *protocol.LogMessageParams
 	case protocol.Warning:
 		log.Print("Warning:", p.Message)
 	case protocol.Info:
-		if c.app.Verbose {
+		if c.app.verbose() {
 			log.Print("Info:", p.Message)
 		}
 	case protocol.Log:
-		if c.app.Verbose {
+		if c.app.verbose() {
 			log.Print("Log:", p.Message)
 		}
 	default:
-		if c.app.Verbose {
+		if c.app.verbose() {
 			log.Print(p.Message)
 		}
 	}
@@ -373,7 +388,7 @@ func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfigur
 			}
 			env[l[0]] = l[1]
 		}
-		results[i] = map[string]interface{}{
+		m := map[string]interface{}{
 			"env": env,
 			"analyses": map[string]bool{
 				"fillreturns":    true,
@@ -382,6 +397,10 @@ func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfigur
 				"undeclaredname": true,
 			},
 		}
+		if c.app.VeryVerbose {
+			m["verboseOutput"] = true
+		}
+		results[i] = m
 	}
 	return results, nil
 }
@@ -495,4 +514,9 @@ func (c *connection) terminate(ctx context.Context) {
 	c.Shutdown(ctx)
 	//TODO: right now calling exit terminates the process, we should rethink that
 	//server.Exit(ctx)
+}
+
+// Implement io.Closer.
+func (c *cmdClient) Close() error {
+	return nil
 }

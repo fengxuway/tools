@@ -7,14 +7,13 @@
 package regtest
 
 import (
-	"fmt"
 	"testing"
 
 	"golang.org/x/tools/internal/lsp/fake"
 )
 
 func TestBadGOPATH(t *testing.T) {
-	const missingImport = `
+	const files = `
 -- main.go --
 package main
 
@@ -22,15 +21,16 @@ func _() {
 	fmt.Println("Hello World")
 }
 `
+	editorConfig := fake.EditorConfig{
+		Env: map[string]string{"GOPATH": ":/path/to/gopath"},
+	}
 	// Test the case given in
 	// https://github.com/fatih/vim-go/issues/2673#issuecomment-622307211.
-	runner.Run(t, missingImport, func(t *testing.T, env *Env) {
+	withOptions(WithEditorConfig(editorConfig)).run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
 		env.Await(env.DiagnosticAtRegexp("main.go", "fmt"))
 		if err := env.Editor.OrganizeImports(env.Ctx, "main.go"); err != nil {
 			t.Fatal(err)
 		}
-	}, WithEditorConfig(fake.EditorConfig{
-		Env: []string{fmt.Sprintf("GOPATH=:/path/to/gopath")},
-	}))
+	})
 }

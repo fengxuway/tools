@@ -8,7 +8,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"path/filepath"
+	"sync"
 
+	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
@@ -22,14 +25,27 @@ type ModificationSource int
 const (
 	// FromDidOpen is a file modification caused by opening a file.
 	FromDidOpen = ModificationSource(iota)
+
 	// FromDidChange is a file modification caused by changing a file.
 	FromDidChange
-	// FromDidChangeWatchedFiles is a file modification caused by a change to a watched file.
+
+	// FromDidChangeWatchedFiles is a file modification caused by a change to a
+	// watched file.
 	FromDidChangeWatchedFiles
+
 	// FromDidSave is a file modification caused by a file save.
 	FromDidSave
+
 	// FromDidClose is a file modification caused by closing a file.
 	FromDidClose
+
+	// FromRegenerateCgo refers to file modifications caused by regenerating
+	// the cgo sources for the workspace.
+	FromRegenerateCgo
+
+	// FromInitialWorkspaceLoad refers to the loading of all packages in the
+	// workspace when the view is first created.
+	FromInitialWorkspaceLoad
 )
 
 func (m ModificationSource) String() string {
@@ -42,6 +58,12 @@ func (m ModificationSource) String() string {
 		return "files changed on disk"
 	case FromDidSave:
 		return "saved files"
+	case FromDidClose:
+		return "close files"
+	case FromRegenerateCgo:
+		return "regenerate cgo"
+	case FromInitialWorkspaceLoad:
+		return "initial workspace load"
 	default:
 		return "unknown file modification"
 	}
@@ -51,6 +73,37 @@ func (s *Server) didOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 	uri := params.TextDocument.URI.SpanURI()
 	if !uri.IsFile() {
 		return nil
+	}
+	// There may not be any matching view in the current session. If that's
+	// the case, try creating a new view based on the opened file path.
+	//
+	// TODO(rstambler): This seems like it would continuously add new
+	// views, but it won't because ViewOf only returns an error when there
+	// are no views in the session. I don't know if that logic should go
+	// here, or if we can continue to rely on that implementation detail.
+	if _, err := s.session.ViewOf(uri); err != nil {
+		// Run `go env GOMOD` to detect a module root. If we are not in a module,
+		// just use the current directory as the root.
+		dir := filepath.Dir(uri.Filename())
+		stdout, err := (&gocommand.Runner{}).Run(ctx, gocommand.Invocation{
+			Verb:       "env",
+			Args:       []string{"GOMOD"},
+			BuildFlags: s.session.Options().BuildFlags,
+			Env:        s.session.Options().Env,
+			WorkingDir: dir,
+		})
+		if err != nil {
+			return err
+		}
+		if stdout.String() != "" {
+			dir = filepath.Dir(stdout.String())
+		}
+		if err := s.addFolders(ctx, []protocol.WorkspaceFolder{{
+			URI:  string(protocol.URIFromPath(dir)),
+			Name: filepath.Base(dir),
+		}}); err != nil {
+			return err
+		}
 	}
 
 	_, err := s.didModifyFiles(ctx, []source.FileModification{
@@ -131,7 +184,7 @@ func (s *Server) didChangeWatchedFiles(ctx context.Context, params *protocol.Did
 	if err != nil {
 		return err
 	}
-	// Clear the diagnostics for any deleted files.
+	// Clear the diagnostics for any deleted files that are not open in the editor.
 	for uri := range deletions {
 		if snapshot := snapshots[uri]; snapshot == nil || snapshot.IsOpen(uri) {
 			continue
@@ -184,12 +237,15 @@ func (s *Server) didClose(ctx context.Context, params *protocol.DidCloseTextDocu
 	if snapshot == nil {
 		return errors.Errorf("no snapshot for %s", uri)
 	}
-	fh, err := snapshot.GetFile(uri)
+	// Check if the file exists on disk after it has been closed. Calling
+	// snapshot.GetFile will add it back to the snapshot even if it doesn't
+	// exist, which will cause problems.
+	fh, err := snapshot.View().Session().Cache().GetFile(ctx, uri)
 	if err != nil {
 		return err
 	}
 	// If a file has been closed and is not on disk, clear its diagnostics.
-	if _, _, err := fh.Read(ctx); err != nil {
+	if _, err := fh.Read(); err != nil {
 		return s.client.PublishDiagnostics(ctx, &protocol.PublishDiagnosticsParams{
 			URI:         protocol.URIFromSpanURI(uri),
 			Diagnostics: []protocol.Diagnostic{},
@@ -200,6 +256,18 @@ func (s *Server) didClose(ctx context.Context, params *protocol.DidCloseTextDocu
 }
 
 func (s *Server) didModifyFiles(ctx context.Context, modifications []source.FileModification, cause ModificationSource) (map[span.URI]source.Snapshot, error) {
+	// diagnosticWG tracks outstanding diagnostic work as a result of this file
+	// modification.
+	var diagnosticWG sync.WaitGroup
+	if s.session.Options().VerboseWorkDoneProgress {
+		work := s.StartWork(ctx, DiagnosticWorkTitle(cause), "Calculating file diagnostics...", nil)
+		defer func() {
+			go func() {
+				diagnosticWG.Wait()
+				work.End(ctx, "Done.")
+			}()
+		}()
+	}
 	snapshots, err := s.session.DidModifyFiles(ctx, modifications)
 	if err != nil {
 		return nil, err
@@ -237,17 +305,17 @@ func (s *Server) didModifyFiles(ctx context.Context, modifications []source.File
 		// If a modification comes in for the view's go.mod file and the view
 		// was never properly initialized, or the view does not have
 		// a go.mod file, try to recreate the associated view.
-		if modfile, _ := snapshot.View().ModFiles(); modfile == "" {
+		if modfile := snapshot.View().ModFile(); modfile == "" {
 			for _, uri := range uris {
 				// Don't rebuild the view until the go.mod is on disk.
 				if !snapshot.IsSaved(uri) {
 					continue
 				}
-				fh, err := snapshot.GetFile(uri)
+				fh, err := snapshot.GetFile(ctx, uri)
 				if err != nil {
 					return nil, err
 				}
-				switch fh.Identity().Kind {
+				switch fh.Kind() {
 				case source.Mod:
 					newSnapshot, err := snapshot.View().Rebuild(ctx)
 					if err != nil {
@@ -259,11 +327,9 @@ func (s *Server) didModifyFiles(ctx context.Context, modifications []source.File
 				}
 			}
 		}
+		diagnosticWG.Add(1)
 		go func(snapshot source.Snapshot) {
-			if s.session.Options().VerboseWorkDoneProgress {
-				work := s.StartWork(ctx, DiagnosticWorkTitle(cause), "Calculating file diagnostics...", nil)
-				defer work.End(ctx, "Done.")
-			}
+			defer diagnosticWG.Done()
 			s.diagnoseSnapshot(snapshot)
 		}(snapshot)
 	}
@@ -298,7 +364,11 @@ func (s *Server) changedText(ctx context.Context, uri span.URI, changes []protoc
 }
 
 func (s *Server) applyIncrementalChanges(ctx context.Context, uri span.URI, changes []protocol.TextDocumentContentChangeEvent) ([]byte, error) {
-	content, _, err := s.session.GetFile(uri).Read(ctx)
+	fh, err := s.session.GetFile(ctx, uri)
+	if err != nil {
+		return nil, err
+	}
+	content, err := fh.Read()
 	if err != nil {
 		return nil, fmt.Errorf("%w: file not found (%v)", jsonrpc2.ErrInternal, err)
 	}

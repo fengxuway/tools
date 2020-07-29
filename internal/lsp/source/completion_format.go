@@ -17,7 +17,6 @@ import (
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/snippet"
 	"golang.org/x/tools/internal/span"
-	errors "golang.org/x/xerrors"
 )
 
 // formatCompletion creates a completion item for a given candidate.
@@ -166,6 +165,7 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		Score:               cand.score,
 		Depth:               len(c.deepState.chain),
 		snippet:             snip,
+		obj:                 obj,
 	}
 	// If the user doesn't want documentation for completion items.
 	if !c.opts.documentation {
@@ -186,15 +186,22 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 	if cand.imp != nil && cand.imp.pkg != nil {
 		searchPkg = cand.imp.pkg
 	}
-	file, pkg, err := findPosInPackage(c.snapshot.View(), searchPkg, obj.Pos())
+
+	pgf, pkg, err := findPosInPackage(c.snapshot.View(), searchPkg, obj.Pos())
 	if err != nil {
 		return item, nil
 	}
-	ident, err := findIdentifier(ctx, c.snapshot, pkg, file, obj.Pos())
+
+	posToDecl, err := c.snapshot.PosToDecl(ctx, pgf)
 	if err != nil {
+		return CompletionItem{}, err
+	}
+	decl := posToDecl[obj.Pos()]
+	if decl == nil {
 		return item, nil
 	}
-	hover, err := ident.Hover(ctx)
+
+	hover, err := hoverInfo(pkg, obj, decl)
 	if err != nil {
 		event.Error(ctx, "failed to find Hover", err, tag.URI.Of(uri))
 		return item, nil
@@ -212,18 +219,12 @@ func (c *completer) importEdits(ctx context.Context, imp *importInfo) ([]protoco
 		return nil, nil
 	}
 
-	uri := span.URIFromPath(c.filename)
-	var ph ParseGoHandle
-	for _, h := range c.pkg.CompiledGoFiles() {
-		if h.File().Identity().URI == uri {
-			ph = h
-		}
-	}
-	if ph == nil {
-		return nil, errors.Errorf("building import completion for %v: no ParseGoHandle for %s", imp.importPath, c.filename)
+	pgf, err := c.pkg.File(span.URIFromPath(c.filename))
+	if err != nil {
+		return nil, err
 	}
 
-	return computeOneImportFixEdits(ctx, c.snapshot.View(), ph, &imports.ImportFix{
+	return computeOneImportFixEdits(ctx, c.snapshot.View(), pgf, &imports.ImportFix{
 		StmtInfo: imports.ImportInfo{
 			ImportPath: imp.importPath,
 			Name:       imp.name,

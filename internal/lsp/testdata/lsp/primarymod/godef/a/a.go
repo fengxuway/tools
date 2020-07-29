@@ -12,6 +12,14 @@ var (
 	x string //@x,hover("x", x)
 )
 
+// Constant block. When I hover on h, I should see this comment.
+const (
+	// When I hover on g, I should see this comment.
+	g = 1 //@g,hover("g", g)
+
+	h = 2 //@h,hover("h", h)
+)
+
 // z is a variable too.
 var z string //@z,hover("z", z)
 
@@ -33,4 +41,34 @@ func AStuff() { //@AStuff
 
 	var typ *types.Named //@mark(typesImport, "types"),hover("types", typesImport)
 	typ.Obj().Name()     //@Name,hover("Name", Name)
+}
+
+type A struct {
+}
+
+func (_ A) Hi() {} //@mark(AHi, "Hi")
+
+type S struct {
+	Field int //@mark(AField, "Field")
+	R         // embed a struct
+	H         // embed an interface
+}
+
+type R struct {
+	Field2 int //@mark(AField2, "Field2")
+}
+
+func (_ R) Hey() {} //@mark(AHey, "Hey")
+
+type H interface {
+	Goodbye() //@mark(AGoodbye, "Goodbye")
+}
+
+type I interface {
+	B() //@mark(AB, "B")
+	J
+}
+
+type J interface {
+	Hello() //@mark(AHello, "Hello")
 }

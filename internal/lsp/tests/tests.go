@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +29,7 @@ import (
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
+	"golang.org/x/tools/internal/testenv"
 	"golang.org/x/tools/txtar"
 )
 
@@ -57,6 +57,7 @@ type FoldingRanges []span.Span
 type Formats []span.Span
 type Imports []span.Span
 type SuggestedFixes map[span.Span][]string
+type FunctionExtractions map[span.Span]span.Span
 type Definitions map[span.Span]Definition
 type Implementations map[span.Span][]span.Span
 type Highlights map[span.Span][]span.Span
@@ -87,6 +88,7 @@ type Data struct {
 	Formats                       Formats
 	Imports                       Imports
 	SuggestedFixes                SuggestedFixes
+	FunctionExtractions           FunctionExtractions
 	Definitions                   Definitions
 	Implementations               Implementations
 	Highlights                    Highlights
@@ -128,6 +130,7 @@ type Tests interface {
 	Format(*testing.T, span.Span)
 	Import(*testing.T, span.Span)
 	SuggestedFix(*testing.T, span.Span, []string)
+	FunctionExtraction(*testing.T, span.Span, span.Span)
 	Definition(*testing.T, span.Span, Definition)
 	Implementation(*testing.T, span.Span, []span.Span)
 	Highlight(*testing.T, span.Span, []span.Span)
@@ -216,13 +219,16 @@ func DefaultOptions() source.Options {
 		source.Go: {
 			protocol.SourceOrganizeImports: true,
 			protocol.QuickFix:              true,
+			protocol.RefactorRewrite:       true,
+			protocol.RefactorExtract:       true,
+			protocol.SourceFixAll:          true,
 		},
 		source.Mod: {
 			protocol.SourceOrganizeImports: true,
 		},
 		source.Sum: {},
 	}
-	o.UserOptions.EnabledCodeLens[source.CommandTest] = true
+	o.UserOptions.EnabledCodeLens[source.CommandTest.Name] = true
 	o.HoverKind = source.SynopsisDocumentation
 	o.InsertTextFormat = protocol.SnippetTextFormat
 	o.CompletionBudget = time.Minute
@@ -231,8 +237,7 @@ func DefaultOptions() source.Options {
 }
 
 var (
-	haveCgo = false
-	go115   = false
+	go115 = false
 )
 
 // Load creates the folder structure required when testing with modules.
@@ -286,6 +291,7 @@ func Load(t testing.TB, exporter packagestest.Exporter, dir string) []*Data {
 			Renames:                       make(Renames),
 			PrepareRenames:                make(PrepareRenames),
 			SuggestedFixes:                make(SuggestedFixes),
+			FunctionExtractions:           make(FunctionExtractions),
 			Symbols:                       make(Symbols),
 			symbolsChildren:               make(SymbolsChildren),
 			symbolInformation:             make(SymbolInformation),
@@ -418,6 +424,7 @@ func Load(t testing.TB, exporter packagestest.Exporter, dir string) []*Data {
 			"signature":       datum.collectSignatures,
 			"link":            datum.collectLinks,
 			"suggestedfix":    datum.collectSuggestedFixes,
+			"extractfunc":     datum.collectFunctionExtractions,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -453,8 +460,8 @@ func Run(t *testing.T, tests Tests, data *Data) {
 			for i, e := range exp {
 				t.Run(SpanName(src)+"_"+strconv.Itoa(i), func(t *testing.T) {
 					t.Helper()
-					if (!haveCgo || runtime.GOOS == "android") && strings.Contains(t.Name(), "cgo") {
-						t.Skip("test requires cgo, not supported")
+					if strings.Contains(t.Name(), "cgo") {
+						testenv.NeedsTool(t, "cgo")
 					}
 					if !go115 && strings.Contains(t.Name(), "declarecgo") {
 						t.Skip("test requires Go 1.15")
@@ -609,13 +616,27 @@ func Run(t *testing.T, tests Tests, data *Data) {
 		}
 	})
 
+	t.Run("FunctionExtraction", func(t *testing.T) {
+		t.Helper()
+		for start, end := range data.FunctionExtractions {
+			// Check if we should skip this spn if the -modfile flag is not available.
+			if shouldSkip(data, start.URI()) {
+				continue
+			}
+			t.Run(SpanName(start), func(t *testing.T) {
+				t.Helper()
+				tests.FunctionExtraction(t, start, end)
+			})
+		}
+	})
+
 	t.Run("Definition", func(t *testing.T) {
 		t.Helper()
 		for spn, d := range data.Definitions {
 			t.Run(SpanName(spn), func(t *testing.T) {
 				t.Helper()
-				if (!haveCgo || runtime.GOOS == "android") && strings.Contains(t.Name(), "cgo") {
-					t.Skip("test requires cgo, not supported")
+				if strings.Contains(t.Name(), "cgo") {
+					testenv.NeedsTool(t, "cgo")
 				}
 				if !go115 && strings.Contains(t.Name(), "declarecgo") {
 					t.Skip("test requires Go 1.15")
@@ -799,6 +820,7 @@ func checkData(t *testing.T, data *Data) {
 	fmt.Fprintf(buf, "FormatCount = %v\n", len(data.Formats))
 	fmt.Fprintf(buf, "ImportCount = %v\n", len(data.Imports))
 	fmt.Fprintf(buf, "SuggestedFixCount = %v\n", len(data.SuggestedFixes))
+	fmt.Fprintf(buf, "FunctionExtractionCount = %v\n", len(data.FunctionExtractions))
 	fmt.Fprintf(buf, "DefinitionsCount = %v\n", definitionCount)
 	fmt.Fprintf(buf, "TypeDefinitionsCount = %v\n", typeDefinitionCount)
 	fmt.Fprintf(buf, "HighlightsCount = %v\n", len(data.Highlights))
@@ -818,7 +840,7 @@ func checkData(t *testing.T, data *Data) {
 	}))
 	got := buf.String()
 	if want != got {
-		t.Errorf("test summary does not match: %v", Diff(want, got))
+		t.Errorf("test summary does not match:\n%s", Diff(want, got))
 	}
 }
 
@@ -887,6 +909,7 @@ func (data *Data) Golden(tag string, target string, update func() ([]byte, error
 		}
 		file.Data = append(contents, '\n') // add trailing \n for txtar
 		golden.Modified = true
+
 	}
 	if file == nil {
 		data.t.Fatalf("could not find golden contents %v: %v", fragment, tag)
@@ -1018,6 +1041,12 @@ func (data *Data) collectSuggestedFixes(spn span.Span, actionKind string) {
 		data.SuggestedFixes[spn] = []string{}
 	}
 	data.SuggestedFixes[spn] = append(data.SuggestedFixes[spn], actionKind)
+}
+
+func (data *Data) collectFunctionExtractions(start span.Span, end span.Span) {
+	if _, ok := data.FunctionExtractions[start]; !ok {
+		data.FunctionExtractions[start] = end
+	}
 }
 
 func (data *Data) collectDefinitions(src, target span.Span) {

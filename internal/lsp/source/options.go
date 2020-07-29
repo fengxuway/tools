@@ -5,6 +5,7 @@
 package source
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
@@ -38,6 +39,7 @@ import (
 	"golang.org/x/tools/go/analysis/passes/unsafeptr"
 	"golang.org/x/tools/go/analysis/passes/unusedresult"
 	"golang.org/x/tools/internal/lsp/analysis/fillreturns"
+	"golang.org/x/tools/internal/lsp/analysis/fillstruct"
 	"golang.org/x/tools/internal/lsp/analysis/nonewvars"
 	"golang.org/x/tools/internal/lsp/analysis/noresultvalues"
 	"golang.org/x/tools/internal/lsp/analysis/simplifycompositelit"
@@ -52,21 +54,14 @@ import (
 	errors "golang.org/x/xerrors"
 )
 
-const (
-	// CommandGenerate is a gopls command to run `go test` for a specific test function.
-	CommandTest = "test"
-	// CommandGenerate is a gopls command to run `go generate` for a directory.
-	CommandGenerate = "generate"
-	// CommandTidy is a gopls command to run `go mod tidy` for a module.
-	CommandTidy = "tidy"
-	// CommandUpgradeDependency is a gopls command to upgrade a dependency.
-	CommandUpgradeDependency = "upgrade.dependency"
-)
-
 // DefaultOptions is the options that are used for Gopls execution independent
 // of any externally provided configuration (LSP initialization, command
 // invokation, etc.).
 func DefaultOptions() Options {
+	var commands []string
+	for _, c := range Commands {
+		commands = append(commands, c.Name)
+	}
 	return Options{
 		ClientOptions: ClientOptions{
 			InsertTextFormat:                  protocol.PlainTextTextFormat,
@@ -83,45 +78,47 @@ func DefaultOptions() Options {
 					protocol.SourceFixAll:          true,
 					protocol.SourceOrganizeImports: true,
 					protocol.QuickFix:              true,
+					protocol.RefactorRewrite:       true,
+					protocol.RefactorExtract:       true,
 				},
 				Mod: {
 					protocol.SourceOrganizeImports: true,
 				},
 				Sum: {},
 			},
-			SupportedCommands: []string{
-				CommandTest,              // for "go test" commands
-				CommandTidy,              // for go.mod files
-				CommandUpgradeDependency, // for go.mod dependency upgrades
-				CommandGenerate,          // for "go generate" commands
-			},
+			SupportedCommands: commands,
 		},
 		UserOptions: UserOptions{
 			Env:                     os.Environ(),
 			HoverKind:               FullDocumentation,
 			LinkTarget:              "pkg.go.dev",
+			LinksInHover:            true,
 			Matcher:                 Fuzzy,
 			SymbolMatcher:           SymbolFuzzy,
 			DeepCompletion:          true,
 			UnimportedCompletion:    true,
 			CompletionDocumentation: true,
 			EnabledCodeLens: map[string]bool{
-				CommandGenerate:          true,
-				CommandUpgradeDependency: true,
+				CommandGenerate.Name:          true,
+				CommandUpgradeDependency.Name: true,
+				CommandRegenerateCgo.Name:     true,
+				CommandToggleDetails.Name:     false,
 			},
 		},
 		DebuggingOptions: DebuggingOptions{
-			CompletionBudget: 100 * time.Millisecond,
+			CompletionBudget:   100 * time.Millisecond,
+			LiteralCompletions: true,
 		},
 		ExperimentalOptions: ExperimentalOptions{
 			TempModfile: true,
 		},
 		Hooks: Hooks{
-			ComputeEdits:       myers.ComputeEdits,
-			URLRegexp:          regexp.MustCompile(`(http|ftp|https)://([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?`),
-			DefaultAnalyzers:   defaultAnalyzers(),
-			TypeErrorAnalyzers: typeErrorAnalyzers(),
-			GoDiff:             true,
+			ComputeEdits:         myers.ComputeEdits,
+			URLRegexp:            urlRegexp(),
+			DefaultAnalyzers:     defaultAnalyzers(),
+			TypeErrorAnalyzers:   typeErrorAnalyzers(),
+			ConvenienceAnalyzers: convenienceAnalyzers(),
+			GoDiff:               true,
 		},
 	}
 }
@@ -188,8 +185,16 @@ type UserOptions struct {
 	// StaticCheck enables additional analyses from staticcheck.io.
 	StaticCheck bool
 
-	// LinkTarget is the website used for documentation.
+	// LinkTarget is the website used for documentation. If empty, no link is
+	// provided.
 	LinkTarget string
+
+	// LinksInHover toggles the presence of links to documentation in hover.
+	LinksInHover bool
+
+	// ImportShortcut specifies whether import statements should link to
+	// documentation or go to definitions. The default is both.
+	ImportShortcut ImportShortcut
 
 	// LocalPrefix is used to specify goimports's -local behavior.
 	LocalPrefix string
@@ -199,6 +204,10 @@ type UserOptions struct {
 
 	// SymbolMatcher specifies the type of matcher to use for symbol requests.
 	SymbolMatcher SymbolMatcher
+
+	// SymbolStyle specifies what style of symbols to return in symbol requests
+	// (package qualified, fully qualified, etc).
+	SymbolStyle SymbolStyle
 
 	// DeepCompletion allows completion to perform nested searches through
 	// possible candidates.
@@ -214,6 +223,25 @@ type UserOptions struct {
 	// Placeholders adds placeholders to parameters and structs in completion
 	// results.
 	Placeholders bool
+
+	// Gofumpt indicates if we should run gofumpt formatting.
+	Gofumpt bool
+}
+
+type ImportShortcut int
+
+const (
+	Both ImportShortcut = iota
+	Link
+	Definition
+)
+
+func (s ImportShortcut) ShowLinks() bool {
+	return s == Both || s == Link
+}
+
+func (s ImportShortcut) ShowDefinition() bool {
+	return s == Both || s == Definition
 }
 
 type completionOptions struct {
@@ -230,11 +258,13 @@ type completionOptions struct {
 // Hooks contains configuration that is provided to the Gopls command by the
 // main package.
 type Hooks struct {
-	GoDiff             bool
-	ComputeEdits       diff.ComputeEdits
-	URLRegexp          *regexp.Regexp
-	DefaultAnalyzers   map[string]Analyzer
-	TypeErrorAnalyzers map[string]Analyzer
+	GoDiff               bool
+	ComputeEdits         diff.ComputeEdits
+	URLRegexp            *regexp.Regexp
+	DefaultAnalyzers     map[string]Analyzer
+	TypeErrorAnalyzers   map[string]Analyzer
+	ConvenienceAnalyzers map[string]Analyzer
+	GofumptFormat        func(ctx context.Context, src []byte) ([]byte, error)
 }
 
 func (o Options) AddDefaultAnalyzer(a *analysis.Analyzer) {
@@ -264,6 +294,11 @@ type DebuggingOptions struct {
 	// dynamically reduce the search scope to ensure we return timely
 	// results. Zero means unlimited.
 	CompletionBudget time.Duration
+
+	// LiteralCompletions controls whether literal candidates such as
+	// "&someStruct{}" are offered. Tests disable this flag to simplify
+	// their expected values.
+	LiteralCompletions bool
 }
 
 type Matcher int
@@ -280,6 +315,14 @@ const (
 	SymbolFuzzy = SymbolMatcher(iota)
 	SymbolCaseInsensitive
 	SymbolCaseSensitive
+)
+
+type SymbolStyle int
+
+const (
+	PackageQualifiedSymbols = SymbolStyle(iota)
+	FullyQualifiedSymbols
+	DynamicSymbols
 )
 
 type HoverKind int
@@ -428,6 +471,20 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 			o.SymbolMatcher = SymbolCaseInsensitive
 		}
 
+	case "symbolStyle":
+		style, ok := result.asString()
+		if !ok {
+			break
+		}
+		switch style {
+		case "full":
+			o.SymbolStyle = FullyQualifiedSymbols
+		case "dynamic":
+			o.SymbolStyle = DynamicSymbols
+		default:
+			o.SymbolStyle = PackageQualifiedSymbols
+		}
+
 	case "hoverKind":
 		hoverKind, ok := result.asString()
 		if !ok {
@@ -450,6 +507,21 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 
 	case "linkTarget":
 		result.setString(&o.LinkTarget)
+
+	case "linksInHover":
+		result.setBool(&o.LinksInHover)
+
+	case "importShortcut":
+		var s string
+		result.setString(&s)
+		switch s {
+		case "both":
+			o.ImportShortcut = Both
+		case "link":
+			o.ImportShortcut = Link
+		case "definition":
+			o.ImportShortcut = Definition
+		}
 
 	case "analyses":
 		result.setBoolMap(&o.UserEnabledAnalyses)
@@ -480,6 +552,9 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 
 	case "tempModfile":
 		result.setBool(&o.TempModfile)
+
+	case "gofumpt":
+		result.setBool(&o.Gofumpt)
 
 	// Replaced settings.
 	case "experimentalDisabledAnalyses":
@@ -581,28 +656,60 @@ func (r *OptionResult) setString(s *string) {
 	}
 }
 
+// EnabledAnalyzers returns all of the analyzers enabled for the given
+// snapshot.
+func EnabledAnalyzers(snapshot Snapshot) (analyzers []Analyzer) {
+	for _, a := range snapshot.View().Options().DefaultAnalyzers {
+		if a.Enabled(snapshot) {
+			analyzers = append(analyzers, a)
+		}
+	}
+	for _, a := range snapshot.View().Options().TypeErrorAnalyzers {
+		if a.Enabled(snapshot) {
+			analyzers = append(analyzers, a)
+		}
+	}
+	for _, a := range snapshot.View().Options().ConvenienceAnalyzers {
+		if a.Enabled(snapshot) {
+			analyzers = append(analyzers, a)
+		}
+	}
+	return analyzers
+}
+
 func typeErrorAnalyzers() map[string]Analyzer {
 	return map[string]Analyzer{
 		fillreturns.Analyzer.Name: {
 			Analyzer:       fillreturns.Analyzer,
-			enabled:        true,
 			FixesError:     fillreturns.FixesError,
 			HighConfidence: true,
+			enabled:        true,
 		},
 		nonewvars.Analyzer.Name: {
 			Analyzer:   nonewvars.Analyzer,
-			enabled:    true,
 			FixesError: nonewvars.FixesError,
+			enabled:    true,
 		},
 		noresultvalues.Analyzer.Name: {
 			Analyzer:   noresultvalues.Analyzer,
-			enabled:    true,
 			FixesError: noresultvalues.FixesError,
+			enabled:    true,
 		},
 		undeclaredname.Analyzer.Name: {
 			Analyzer:   undeclaredname.Analyzer,
-			enabled:    true,
 			FixesError: undeclaredname.FixesError,
+			Command:    CommandUndeclaredName,
+			enabled:    true,
+		},
+	}
+}
+
+func convenienceAnalyzers() map[string]Analyzer {
+	return map[string]Analyzer{
+		fillstruct.Analyzer.Name: {
+			Analyzer: fillstruct.Analyzer,
+			Command:  CommandFillStruct,
+			enabled:  true,
 		},
 	}
 }
@@ -634,7 +741,7 @@ func defaultAnalyzers() map[string]Analyzer {
 		unsafeptr.Analyzer.Name:    {Analyzer: unsafeptr.Analyzer, enabled: true},
 		unusedresult.Analyzer.Name: {Analyzer: unusedresult.Analyzer, enabled: true},
 
-		// Non-vet analyzers
+		// Non-vet analyzers:
 		deepequalerrors.Analyzer.Name:  {Analyzer: deepequalerrors.Analyzer, enabled: true},
 		sortslice.Analyzer.Name:        {Analyzer: sortslice.Analyzer, enabled: true},
 		testinggoroutine.Analyzer.Name: {Analyzer: testinggoroutine.Analyzer, enabled: true},
@@ -645,4 +752,11 @@ func defaultAnalyzers() map[string]Analyzer {
 		simplifyrange.Analyzer.Name:        {Analyzer: simplifyrange.Analyzer, enabled: true, HighConfidence: true},
 		simplifyslice.Analyzer.Name:        {Analyzer: simplifyslice.Analyzer, enabled: true, HighConfidence: true},
 	}
+}
+
+func urlRegexp() *regexp.Regexp {
+	// Ensure links are matched as full words, not anywhere.
+	re := regexp.MustCompile(`\b(http|ftp|https)://([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?\b`)
+	re.Longest()
+	return re
 }

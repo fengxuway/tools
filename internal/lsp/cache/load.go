@@ -23,7 +23,7 @@ import (
 type metadata struct {
 	id              packageID
 	pkgPath         packagePath
-	name            string
+	name            packageName
 	goFiles         []span.URI
 	compiledGoFiles []span.URI
 	forTest         packagePath
@@ -31,7 +31,7 @@ type metadata struct {
 	errors          []packages.Error
 	deps            []packageID
 	missingDeps     map[packagePath]struct{}
-	module          *packagesinternal.Module
+	module          *packages.Module
 
 	// config is the *packages.Config associated with the loaded package.
 	config *packages.Config
@@ -58,7 +58,7 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 			// Simplify the query if it will be run in the requested directory.
 			// This ensures compatibility with Go 1.12 that doesn't allow
 			// <directory>/... in GOPATH mode.
-			if s.view.folder.Filename() == filename {
+			if s.view.root.Filename() == filename {
 				q = "./..."
 			}
 			query = append(query, q)
@@ -83,8 +83,29 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 	ctx, done := event.Start(ctx, "cache.view.load", tag.Query.Of(query))
 	defer done()
 
-	cfg := s.Config(ctx)
+	cfg := s.config(ctx)
+	cleanup := func() {}
+	if s.view.tmpMod {
+		modFH, err := s.GetFile(ctx, s.view.modURI)
+		if err != nil {
+			return err
+		}
+		var sumFH source.FileHandle
+		if s.view.sumURI != "" {
+			sumFH, err = s.GetFile(ctx, s.view.sumURI)
+			if err != nil {
+				return err
+			}
+		}
+		var tmpURI span.URI
+		tmpURI, cleanup, err = tempModFile(modFH, sumFH)
+		if err != nil {
+			return err
+		}
+		cfg.BuildFlags = append(cfg.BuildFlags, fmt.Sprintf("-modfile=%s", tmpURI.Filename()))
+	}
 	pkgs, err := packages.Load(cfg, query...)
+	cleanup()
 
 	// If the context was canceled, return early. Otherwise, we might be
 	// type-checking an incomplete result. Check the context directly,
@@ -93,13 +114,19 @@ func (s *snapshot) load(ctx context.Context, scopes ...interface{}) error {
 		return ctx.Err()
 	}
 	if err != nil {
+		// Match on common error messages. This is really hacky, but I'm not sure
+		// of any better way. This can be removed when golang/go#39164 is resolved.
+		if strings.Contains(err.Error(), "inconsistent vendoring") {
+			return source.InconsistentVendoring
+		}
 		event.Error(ctx, "go/packages.Load", err, tag.Snapshot.Of(s.ID()), tag.Directory.Of(cfg.Dir), tag.Query.Of(query), tag.PackageCount.Of(len(pkgs)))
 	} else {
 		event.Log(ctx, "go/packages.Load", tag.Snapshot.Of(s.ID()), tag.Directory.Of(cfg.Dir), tag.Query.Of(query), tag.PackageCount.Of(len(pkgs)))
 	}
 	if len(pkgs) == 0 {
-		return err
+		return errors.Errorf("%v: %w", err, source.PackagesLoadError)
 	}
+
 	for _, pkg := range pkgs {
 		if !containsDir || s.view.Options().VerboseOutput {
 			event.Log(ctx, "go/packages.Load", tag.Snapshot.Of(s.ID()), tag.PackagePath.Of(pkg.PkgPath), tag.Files.Of(pkg.CompiledGoFiles))
@@ -144,12 +171,12 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 	m := &metadata{
 		id:         id,
 		pkgPath:    pkgPath,
-		name:       pkg.Name,
+		name:       packageName(pkg.Name),
 		forTest:    packagePath(packagesinternal.GetForTest(pkg)),
 		typesSizes: pkg.TypesSizes,
 		errors:     pkg.Errors,
 		config:     cfg,
-		module:     packagesinternal.GetModule(pkg),
+		module:     pkg.Module,
 	}
 
 	for _, filename := range pkg.CompiledGoFiles {
@@ -204,18 +231,28 @@ func (s *snapshot) setMetadata(ctx context.Context, pkgPath packagePath, pkg *pa
 	}
 
 	// Set the workspace packages. If any of the package's files belong to the
-	// view, then the package is considered to be a workspace package.
+	// view, then the package may be a workspace package.
 	for _, uri := range append(m.compiledGoFiles, m.goFiles...) {
-		// If the package's files are in this view, mark it as a workspace package.
-		if s.view.contains(uri) {
-			// A test variant of a package can only be loaded directly by loading
-			// the non-test variant with -test. Track the import path of the non-test variant.
-			if m.forTest != "" {
-				s.workspacePackages[m.id] = m.forTest
-			} else {
-				s.workspacePackages[m.id] = pkgPath
-			}
-			break
+		if !s.view.contains(uri) {
+			continue
+		}
+
+		// The package's files are in this view. It may be a workspace package.
+		if strings.Contains(string(uri), "/vendor/") {
+			// Vendored packages are not likely to be interesting to the user.
+			continue
+		}
+
+		switch {
+		case m.forTest == "":
+			// A normal package.
+			s.workspacePackages[m.id] = pkgPath
+		case m.forTest == m.pkgPath, m.forTest+"_test" == m.pkgPath:
+			// The test variant of some workspace package or its x_test.
+			// To load it, we need to load the non-test variant with -test.
+			s.workspacePackages[m.id] = m.forTest
+		default:
+			// A test variant of some intermediate package. We don't care about it.
 		}
 	}
 	return m, nil

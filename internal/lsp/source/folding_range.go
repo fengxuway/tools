@@ -18,15 +18,14 @@ type FoldingRangeInfo struct {
 func FoldingRange(ctx context.Context, snapshot Snapshot, fh FileHandle, lineFoldingOnly bool) (ranges []*FoldingRangeInfo, err error) {
 	// TODO(suzmue): consider limiting the number of folding ranges returned, and
 	// implement a way to prioritize folding ranges in that case.
-	pgh := snapshot.View().Session().Cache().ParseGoHandle(fh, ParseFull)
-	file, _, m, _, err := pgh.Parse(ctx)
+	pgf, err := snapshot.ParseGo(ctx, fh, ParseFull)
 	if err != nil {
 		return nil, err
 	}
 	fset := snapshot.View().Session().Cache().FileSet()
 
 	// Get folding ranges for comments separately as they are not walked by ast.Inspect.
-	ranges = append(ranges, commentsFoldingRange(fset, m, file)...)
+	ranges = append(ranges, commentsFoldingRange(fset, pgf.Mapper, pgf.File)...)
 
 	foldingFunc := foldingRange
 	if lineFoldingOnly {
@@ -34,14 +33,14 @@ func FoldingRange(ctx context.Context, snapshot Snapshot, fh FileHandle, lineFol
 	}
 
 	visit := func(n ast.Node) bool {
-		rng := foldingFunc(fset, m, n)
+		rng := foldingFunc(fset, pgf.Mapper, n)
 		if rng != nil {
 			ranges = append(ranges, rng)
 		}
 		return true
 	}
 	// Walk the ast and collect folding ranges.
-	ast.Inspect(file, visit)
+	ast.Inspect(pgf.File, visit)
 
 	sort.Slice(ranges, func(i, j int) bool {
 		irng, _ := ranges[i].Range()
@@ -76,6 +75,9 @@ func foldingRange(fset *token.FileSet, m *protocol.ColumnMapper, n ast.Node) *Fo
 			kind = protocol.Imports
 		}
 		start, end = n.Lparen+1, n.Rparen
+	case *ast.CompositeLit:
+		// Fold from position of "{" to position of "}".
+		start, end = n.Lbrace+1, n.Rbrace
 	}
 	if !start.IsValid() || !end.IsValid() {
 		return nil
@@ -155,6 +157,15 @@ func lineFoldingRange(fset *token.FileSet, m *protocol.ColumnMapper, n ast.Node)
 			break
 		}
 		start, end = n.Lparen+1, n.Specs[nSpecs-1].End()
+	case *ast.CompositeLit:
+		// Fold lines between "{" and "}".
+		if !n.Lbrace.IsValid() || !n.Rbrace.IsValid() {
+			break
+		}
+		if len(n.Elts) == 0 {
+			break
+		}
+		start, end = n.Lbrace+1, n.Elts[len(n.Elts)-1].End()
 	}
 
 	// Check that folding positions are valid.

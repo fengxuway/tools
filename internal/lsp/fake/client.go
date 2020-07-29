@@ -6,6 +6,7 @@ package fake
 
 import (
 	"context"
+	"fmt"
 
 	"golang.org/x/tools/internal/lsp/protocol"
 )
@@ -17,6 +18,7 @@ type ClientHooks struct {
 	OnWorkDoneProgressCreate func(context.Context, *protocol.WorkDoneProgressCreateParams) error
 	OnProgress               func(context.Context, *protocol.ProgressParams) error
 	OnShowMessage            func(context.Context, *protocol.ShowMessageParams) error
+	OnShowMessageRequest     func(context.Context, *protocol.ShowMessageRequestParams) error
 }
 
 // Client is an adapter that converts an *Editor into an LSP Client. It mosly
@@ -34,7 +36,15 @@ func (c *Client) ShowMessage(ctx context.Context, params *protocol.ShowMessagePa
 }
 
 func (c *Client) ShowMessageRequest(ctx context.Context, params *protocol.ShowMessageRequestParams) (*protocol.MessageActionItem, error) {
-	return nil, nil
+	if c.hooks.OnShowMessageRequest != nil {
+		if err := c.hooks.OnShowMessageRequest(ctx, params); err != nil {
+			return nil, err
+		}
+	}
+	if len(params.Actions) == 0 || len(params.Actions) > 1 {
+		return nil, fmt.Errorf("fake editor cannot handle multiple action items")
+	}
+	return &params.Actions[0], nil
 }
 
 func (c *Client) LogMessage(ctx context.Context, params *protocol.LogMessageParams) error {
@@ -101,7 +111,9 @@ func (c *Client) ApplyEdit(ctx context.Context, params *protocol.ApplyWorkspaceE
 	for _, change := range params.Edit.DocumentChanges {
 		path := c.editor.sandbox.Workdir.URIToPath(change.TextDocument.URI)
 		edits := convertEdits(change.Edits)
-		c.editor.EditBuffer(ctx, path, edits)
+		if err := c.editor.EditBuffer(ctx, path, edits); err != nil {
+			return nil, err
+		}
 	}
 	return &protocol.ApplyWorkspaceEditResponse{Applied: true}, nil
 }

@@ -56,6 +56,8 @@ func testSource(t *testing.T, exporter packagestest.Exporter) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer view.Shutdown(ctx)
+
 		// Enable type error analyses for tests.
 		// TODO(golang/go#38212): Delete this once they are enabled by default.
 		tests.EnableAllAnalyzers(snapshot, &options)
@@ -117,11 +119,9 @@ func (r *runner) Completion(t *testing.T, src span.Span, test tests.Completion, 
 		opts.Matcher = source.CaseInsensitive
 		opts.DeepCompletion = false
 		opts.UnimportedCompletion = false
-		opts.InsertTextFormat = protocol.PlainTextTextFormat
-		// Only enable literal completions if in the completion literals tests.
-		// TODO(rstambler): Separate out literal completion tests.
-		if strings.Contains(string(src.URI()), "literal") {
-			opts.InsertTextFormat = protocol.SnippetTextFormat
+		opts.InsertTextFormat = protocol.SnippetTextFormat
+		if !strings.Contains(string(src.URI()), "literal") {
+			opts.LiteralCompletions = false
 		}
 	})
 	got = tests.FilterBuiltins(src, got)
@@ -228,7 +228,7 @@ func (r *runner) RankCompletion(t *testing.T, src span.Span, test tests.Completi
 }
 
 func (r *runner) callCompletion(t *testing.T, src span.Span, options func(*source.Options)) (string, []protocol.CompletionItem) {
-	fh, err := r.view.Snapshot().GetFile(src.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, src.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,11 +274,11 @@ func (r *runner) callCompletion(t *testing.T, src span.Span, options func(*sourc
 func (r *runner) FoldingRanges(t *testing.T, spn span.Span) {
 	uri := spn.URI()
 
-	fh, err := r.view.Snapshot().GetFile(spn.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, _, err := fh.Read(r.ctx)
+	data, err := fh.Read()
 	if err != nil {
 		t.Error(err)
 		return
@@ -414,7 +414,7 @@ func (r *runner) Format(t *testing.T, spn span.Span) {
 		out, _ := cmd.Output() // ignore error, sometimes we have intentionally ungofmt-able files
 		return out, nil
 	}))
-	fh, err := r.view.Snapshot().GetFile(spn.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +425,7 @@ func (r *runner) Format(t *testing.T, spn span.Span) {
 		}
 		return
 	}
-	data, _, err := fh.Read(r.ctx)
+	data, err := fh.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +444,7 @@ func (r *runner) Format(t *testing.T, spn span.Span) {
 }
 
 func (r *runner) Import(t *testing.T, spn span.Span) {
-	fh, err := r.view.Snapshot().GetFile(spn.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,11 +452,11 @@ func (r *runner) Import(t *testing.T, spn span.Span) {
 	if err != nil {
 		t.Error(err)
 	}
-	data, _, err := fh.Read(r.ctx)
+	data, err := fh.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := r.data.Mapper(fh.Identity().URI)
+	m, err := r.data.Mapper(fh.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,14 +474,12 @@ func (r *runner) Import(t *testing.T, spn span.Span) {
 	}
 }
 
-func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string) {}
-
 func (r *runner) Definition(t *testing.T, spn span.Span, d tests.Definition) {
 	_, srcRng, err := spanToRange(r.data, d.Src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh, err := r.view.Snapshot().GetFile(spn.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +487,7 @@ func (r *runner) Definition(t *testing.T, spn span.Span, d tests.Definition) {
 	if err != nil {
 		t.Fatalf("failed for %v: %v", d.Src, err)
 	}
-	h, err := ident.Hover(r.ctx)
+	h, err := source.HoverIdentifier(r.ctx, ident)
 	if err != nil {
 		t.Fatalf("failed for %v: %v", d.Src, err)
 	}
@@ -516,7 +514,7 @@ func (r *runner) Definition(t *testing.T, spn span.Span, d tests.Definition) {
 			return []byte(hover), nil
 		}))
 		if hover != expectHover {
-			t.Errorf("for %v got %q want %q", d.Src, hover, expectHover)
+			t.Errorf("hover for %s failed:\n%s", d.Src, tests.Diff(expectHover, hover))
 		}
 	}
 	if !d.OnlyHover {
@@ -541,7 +539,7 @@ func (r *runner) Implementation(t *testing.T, spn span.Span, impls []span.Span) 
 	if err != nil {
 		t.Fatalf("failed for %v: %v", spn, err)
 	}
-	fh, err := r.view.Snapshot().GetFile(spn.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +583,7 @@ func (r *runner) Highlight(t *testing.T, src span.Span, locations []span.Span) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh, err := r.view.Snapshot().GetFile(src.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, src.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +592,7 @@ func (r *runner) Highlight(t *testing.T, src span.Span, locations []span.Span) {
 		t.Errorf("highlight failed for %s: %v", src.URI(), err)
 	}
 	if len(highlights) != len(locations) {
-		t.Errorf("got %d highlights for highlight at %v:%v:%v, expected %d", len(highlights), src.URI().Filename(), src.Start().Line(), src.Start().Column(), len(locations))
+		t.Fatalf("got %d highlights for highlight at %v:%v:%v, expected %d", len(highlights), src.URI().Filename(), src.Start().Line(), src.Start().Column(), len(locations))
 	}
 	// Check to make sure highlights have a valid range.
 	var results []span.Span
@@ -624,7 +622,7 @@ func (r *runner) References(t *testing.T, src span.Span, itemList []span.Span) {
 		t.Fatal(err)
 	}
 	snapshot := r.view.Snapshot()
-	fh, err := snapshot.GetFile(src.URI())
+	fh, err := snapshot.GetFile(r.ctx, src.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,14 +661,13 @@ func (r *runner) References(t *testing.T, src span.Span, itemList []span.Span) {
 }
 
 func (r *runner) Rename(t *testing.T, spn span.Span, newText string) {
-	ctx := r.ctx
 	tag := fmt.Sprintf("%s-rename", newText)
 
 	_, srcRng, err := spanToRange(r.data, spn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh, err := r.view.Snapshot().GetFile(spn.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -687,15 +684,15 @@ func (r *runner) Rename(t *testing.T, spn span.Span, newText string) {
 
 	var res []string
 	for editURI, edits := range changes {
-		fh, err := r.view.Snapshot().GetFile(editURI)
+		fh, err := r.view.Snapshot().GetFile(r.ctx, editURI)
 		if err != nil {
 			t.Fatal(err)
 		}
-		data, _, err := fh.Read(ctx)
+		data, err := fh.Read()
 		if err != nil {
 			t.Fatal(err)
 		}
-		m, err := r.data.Mapper(fh.Identity().URI)
+		m, err := r.data.Mapper(fh.URI())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -752,7 +749,7 @@ func (r *runner) PrepareRename(t *testing.T, src span.Span, want *source.Prepare
 		t.Fatal(err)
 	}
 	// Find the identifier at the position.
-	fh, err := r.view.Snapshot().GetFile(src.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, src.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -787,7 +784,7 @@ func (r *runner) PrepareRename(t *testing.T, src span.Span, want *source.Prepare
 }
 
 func (r *runner) Symbols(t *testing.T, uri span.URI, expectedSymbols []protocol.DocumentSymbol) {
-	fh, err := r.view.Snapshot().GetFile(uri)
+	fh, err := r.view.Snapshot().GetFile(r.ctx, uri)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,15 +815,11 @@ func (r *runner) CaseSensitiveWorkspaceSymbols(t *testing.T, query string, expec
 
 func (r *runner) callWorkspaceSymbols(t *testing.T, query string, matcher source.SymbolMatcher, dirs map[string]struct{}, expectedSymbols []protocol.SymbolInformation) {
 	t.Helper()
-	got, err := source.WorkspaceSymbols(r.ctx, matcher, []source.View{r.view}, query)
+	got, err := source.WorkspaceSymbols(r.ctx, matcher, source.PackageQualifiedSymbols, []source.View{r.view}, query)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got = tests.FilterWorkspaceSymbols(got, dirs)
-	if len(got) != len(expectedSymbols) {
-		t.Errorf("want %d symbols, got %d", len(expectedSymbols), len(got))
-		return
-	}
 	if diff := tests.DiffWorkspaceSymbols(expectedSymbols, got); diff != "" {
 		t.Error(diff)
 	}
@@ -837,7 +830,7 @@ func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.Signa
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh, err := r.view.Snapshot().GetFile(spn.URI())
+	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,17 +852,18 @@ func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.Signa
 		Signatures:      []protocol.SignatureInformation{*gotSignature},
 		ActiveParameter: float64(gotActiveParameter),
 	}
-	if diff := tests.DiffSignatures(spn, got, want); diff != "" {
+	if diff := tests.DiffSignatures(spn, want, got); diff != "" {
 		t.Error(diff)
 	}
 }
 
-func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link) {
-	// This is a pure LSP feature, no source level functionality to be tested.
-}
+// These are pure LSP features, no source level functionality to be tested.
+func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link)         {}
+func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)  {}
+func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span) {}
 
 func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens) {
-	fh, err := r.view.Snapshot().GetFile(uri)
+	fh, err := r.view.Snapshot().GetFile(r.ctx, uri)
 	if err != nil {
 		t.Fatal(err)
 	}
