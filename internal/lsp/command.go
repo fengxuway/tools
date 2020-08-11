@@ -68,7 +68,8 @@ func (s *Server) executeCommand(ctx context.Context, params *protocol.ExecuteCom
 		if err := source.UnmarshalArgs(params.Arguments, &uri, &rng); err != nil {
 			return nil, err
 		}
-		snapshot, fh, ok, err := s.beginFileRequest(ctx, uri, source.Go)
+		snapshot, fh, ok, release, err := s.beginFileRequest(ctx, uri, source.Go)
+		defer release()
 		if !ok {
 			return nil, err
 		}
@@ -101,18 +102,24 @@ func (s *Server) executeCommand(ctx context.Context, params *protocol.ExecuteCom
 		if err := source.UnmarshalArgs(params.Arguments, &uri, &flag, &funcName); err != nil {
 			return nil, err
 		}
-		snapshot, _, ok, err := s.beginFileRequest(ctx, uri, source.UnknownKind)
+		snapshot, _, ok, release, err := s.beginFileRequest(ctx, uri, source.UnknownKind)
+		defer release()
 		if !ok {
 			return nil, err
 		}
-		go s.runTest(ctx, snapshot, []string{flag, funcName})
+		go s.runTest(ctx, snapshot, []string{flag, funcName}, params.WorkDoneToken)
 	case source.CommandGenerate:
 		var uri protocol.DocumentURI
 		var recursive bool
 		if err := source.UnmarshalArgs(params.Arguments, &uri, &recursive); err != nil {
 			return nil, err
 		}
-		go s.runGoGenerate(xcontext.Detach(ctx), uri.SpanURI(), recursive)
+		snapshot, _, ok, release, err := s.beginFileRequest(ctx, uri, source.UnknownKind)
+		defer release()
+		if !ok {
+			return nil, err
+		}
+		go s.runGoGenerate(xcontext.Detach(ctx), snapshot, uri.SpanURI(), recursive, params.WorkDoneToken)
 	case source.CommandRegenerateCgo:
 		var uri protocol.DocumentURI
 		if err := source.UnmarshalArgs(params.Arguments, &uri); err != nil {
@@ -122,7 +129,7 @@ func (s *Server) executeCommand(ctx context.Context, params *protocol.ExecuteCom
 			URI:    uri.SpanURI(),
 			Action: source.InvalidateMetadata,
 		}
-		_, err := s.didModifyFiles(ctx, []source.FileModification{mod}, FromRegenerateCgo)
+		err := s.didModifyFiles(ctx, []source.FileModification{mod}, FromRegenerateCgo)
 		return nil, err
 	case source.CommandTidy, source.CommandVendor:
 		var uri protocol.DocumentURI
@@ -145,31 +152,33 @@ func (s *Server) executeCommand(ctx context.Context, params *protocol.ExecuteCom
 		}
 		err := s.directGoModCommand(ctx, uri, "get", goCmdArgs...)
 		return nil, err
-	default:
-		return nil, fmt.Errorf("unknown command: %s", params.Command)
 	case source.CommandToggleDetails:
 		var fileURI span.URI
 		if err := source.UnmarshalArgs(params.Arguments, &fileURI); err != nil {
 			return nil, err
 		}
-		pkgDir := span.URI(path.Dir(fileURI.Filename()))
-		s.deliveredMu.Lock()
-		if s.gcOptimizatonDetails[pkgDir] {
+		pkgDir := span.URIFromPath(path.Dir(fileURI.Filename()))
+		s.gcOptimizationDetailsMu.Lock()
+		if _, ok := s.gcOptimizatonDetails[pkgDir]; ok {
 			delete(s.gcOptimizatonDetails, pkgDir)
 		} else {
-			s.gcOptimizatonDetails[pkgDir] = true
+			s.gcOptimizatonDetails[pkgDir] = struct{}{}
 		}
+		s.gcOptimizationDetailsMu.Unlock()
 		event.Log(ctx, fmt.Sprintf("gc_details %s now %v %v", pkgDir, s.gcOptimizatonDetails[pkgDir],
 			s.gcOptimizatonDetails))
-		s.deliveredMu.Unlock()
 		// need to recompute diagnostics.
 		// so find the snapshot
 		sv, err := s.session.ViewOf(fileURI)
 		if err != nil {
 			return nil, err
 		}
-		s.diagnoseSnapshot(sv.Snapshot())
+		snapshot, release := sv.Snapshot(ctx)
+		defer release()
+		s.diagnoseSnapshot(snapshot)
 		return nil, nil
+	default:
+		return nil, fmt.Errorf("unknown command: %s", params.Command)
 	}
 	return nil, nil
 }
@@ -179,16 +188,18 @@ func (s *Server) directGoModCommand(ctx context.Context, uri protocol.DocumentUR
 	if err != nil {
 		return err
 	}
-	return view.Snapshot().RunGoCommandDirect(ctx, verb, args)
+	snapshot, release := view.Snapshot(ctx)
+	defer release()
+	return snapshot.RunGoCommandDirect(ctx, verb, args)
 }
 
-func (s *Server) runTest(ctx context.Context, snapshot source.Snapshot, args []string) error {
+func (s *Server) runTest(ctx context.Context, snapshot source.Snapshot, args []string, token protocol.ProgressToken) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	ew := &eventWriter{ctx: ctx, operation: "test"}
 	msg := fmt.Sprintf("running `go test %s`", strings.Join(args, " "))
-	wc := s.newProgressWriter(ctx, "test", msg, msg, cancel)
+	wc := s.progress.newWriter(ctx, "test", msg, msg, token, cancel)
 	defer wc.Close()
 
 	messageType := protocol.Info
@@ -212,12 +223,12 @@ func (s *Server) runTest(ctx context.Context, snapshot source.Snapshot, args []s
 // generate commands. It is exported for testing purposes.
 const GenerateWorkDoneTitle = "generate"
 
-func (s *Server) runGoGenerate(ctx context.Context, uri span.URI, recursive bool) error {
+func (s *Server) runGoGenerate(ctx context.Context, snapshot source.Snapshot, uri span.URI, recursive bool, token protocol.ProgressToken) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	er := &eventWriter{ctx: ctx, operation: "generate"}
-	wc := s.newProgressWriter(ctx, GenerateWorkDoneTitle, "running go generate", "started go generate, check logs for progress", cancel)
+	wc := s.progress.newWriter(ctx, GenerateWorkDoneTitle, "running go generate", "started go generate, check logs for progress", token, cancel)
 	defer wc.Close()
 	args := []string{"-x"}
 	if recursive {
@@ -225,11 +236,7 @@ func (s *Server) runGoGenerate(ctx context.Context, uri span.URI, recursive bool
 	}
 
 	stderr := io.MultiWriter(er, wc)
-	view, err := s.session.ViewOf(uri)
-	if err != nil {
-		return err
-	}
-	snapshot := view.Snapshot()
+
 	if err := snapshot.RunGoCommandPiped(ctx, "generate", args, er, stderr); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil

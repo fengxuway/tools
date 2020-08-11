@@ -104,6 +104,7 @@ func DefaultOptions() Options {
 				CommandRegenerateCgo.Name:     true,
 				CommandToggleDetails.Name:     false,
 			},
+			ExpandWorkspaceToModule: true,
 		},
 		DebuggingOptions: DebuggingOptions{
 			CompletionBudget:   100 * time.Millisecond,
@@ -226,6 +227,10 @@ type UserOptions struct {
 
 	// Gofumpt indicates if we should run gofumpt formatting.
 	Gofumpt bool
+
+	// ExpandWorkspaceToModule is true if we should expand the scope of the
+	// workspace to include the modules containing the workspace folders.
+	ExpandWorkspaceToModule bool
 }
 
 type ImportShortcut int
@@ -281,6 +286,14 @@ type ExperimentalOptions struct {
 	// VerboseWorkDoneProgress controls whether the LSP server should send
 	// progress reports for all work done outside the scope of an RPC.
 	VerboseWorkDoneProgress bool
+
+	// Annotations suppress various kinds of optimization diagnostics
+	// that would be reported by the gc_details command.
+	//   noNilcheck suppresses display of nilchecks.
+	//   noEscape suppresses escape choices.
+	//   noInline suppresses inlining choices.
+	//   noBounds suppresses bounds checking diagnositcs.
+	Annotations map[string]bool
 }
 
 // DebuggingOptions should not affect the logical execution of Gopls, but may
@@ -526,6 +539,18 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 	case "analyses":
 		result.setBoolMap(&o.UserEnabledAnalyses)
 
+	case "annotations":
+		result.setBoolMap(&o.Annotations)
+		for k := range o.Annotations {
+			switch k {
+			case "noEscape", "noNilcheck", "noInline", "noBounds":
+				continue
+			default:
+				result.Name += ":" + k // put mistake(s) in the message
+				result.State = OptionUnexpected
+			}
+		}
+
 	case "codelens":
 		var lensOverrides map[string]bool
 		result.setBoolMap(&lensOverrides)
@@ -555,6 +580,9 @@ func (o *Options) set(name string, value interface{}) OptionResult {
 
 	case "gofumpt":
 		result.setBool(&o.Gofumpt)
+
+	case "expandWorkspaceToModule":
+		result.setBool(&o.ExpandWorkspaceToModule)
 
 	// Replaced settings.
 	case "experimentalDisabledAnalyses":
@@ -660,17 +688,17 @@ func (r *OptionResult) setString(s *string) {
 // snapshot.
 func EnabledAnalyzers(snapshot Snapshot) (analyzers []Analyzer) {
 	for _, a := range snapshot.View().Options().DefaultAnalyzers {
-		if a.Enabled(snapshot) {
+		if a.Enabled(snapshot.View()) {
 			analyzers = append(analyzers, a)
 		}
 	}
 	for _, a := range snapshot.View().Options().TypeErrorAnalyzers {
-		if a.Enabled(snapshot) {
+		if a.Enabled(snapshot.View()) {
 			analyzers = append(analyzers, a)
 		}
 	}
 	for _, a := range snapshot.View().Options().ConvenienceAnalyzers {
-		if a.Enabled(snapshot) {
+		if a.Enabled(snapshot.View()) {
 			analyzers = append(analyzers, a)
 		}
 	}

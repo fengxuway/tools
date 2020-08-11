@@ -69,6 +69,10 @@ type EditorConfig struct {
 	// config option.
 	SymbolMatcher *string
 
+	// LimitWorkspaceScope is true if the user does not want to expand their
+	// workspace scope to the entire module.
+	LimitWorkspaceScope bool
+
 	// WithoutWorkspaceFolders is used to simulate opening a single file in the
 	// editor, without a workspace root. In that case, the client sends neither
 	// workspace folders nor a root URI.
@@ -170,6 +174,7 @@ func (e *Editor) configuration() map[string]interface{} {
 	config := map[string]interface{}{
 		"verboseWorkDoneProgress": true,
 		"env":                     e.overlayEnv(),
+		"expandWorkspaceToModule": !e.Config.LimitWorkspaceScope,
 	}
 
 	if e.Config.CodeLens != nil {
@@ -201,6 +206,12 @@ func (e *Editor) initialize(ctx context.Context, withoutWorkspaceFolders bool, e
 	params.Capabilities.Window.WorkDoneProgress = true
 	// TODO: set client capabilities
 	params.InitializationOptions = e.configuration()
+
+	// This is a bit of a hack, since the fake editor doesn't actually support
+	// watching changed files that match a specific glob pattern. However, the
+	// editor does send didChangeWatchedFiles notifications, so set this to
+	// true.
+	params.Capabilities.Workspace.DidChangeWatchedFiles.DynamicRegistration = true
 
 	params.Trace = "messages"
 	// TODO: support workspace folders.

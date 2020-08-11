@@ -9,10 +9,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go/ast"
 	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -33,8 +33,6 @@ import (
 )
 
 type View struct {
-	memoize.Arg // allow as a memoize.Function arg
-
 	session *Session
 	id      string
 
@@ -117,9 +115,6 @@ type View struct {
 	initializeOnce     *sync.Once
 	initializedErr     error
 
-	// builtin pins the AST and package for builtin.go in memory.
-	builtin *builtinPackageHandle
-
 	// True if the view is either in GOPATH, a module, or some other
 	// non go command build system.
 	hasValidBuildConfiguration bool
@@ -131,9 +126,10 @@ type View struct {
 	// Only possible with Go versions 1.14 and above.
 	tmpMod bool
 
-	// goCommand indicates if the user is using the go command or some other
-	// build system.
-	goCommand bool
+	// noGopackagesDriver is true if the user has no value set for the
+	// GOPACKAGESDRIVER environment variable and no gopackagesdriver binary on
+	// their machine.
+	noGopackagesDriver bool
 
 	// `go env` variables that need to be tracked by gopls.
 	gocache, gomodcache, gopath, goprivate string
@@ -148,19 +144,8 @@ type builtinPackageHandle struct {
 }
 
 type builtinPackageData struct {
-	memoize.NoCopy
-
-	pkg *ast.Package
-	pgf *source.ParsedGoFile
-	err error
-}
-
-func (d *builtinPackageData) Package() *ast.Package {
-	return d.pkg
-}
-
-func (d *builtinPackageData) ParsedFile() *source.ParsedGoFile {
-	return d.pgf
+	parsed *source.BuiltinPackage
+	err    error
 }
 
 // fileBase holds the common functionality for all files.
@@ -286,76 +271,17 @@ func (v *View) SetOptions(ctx context.Context, options source.Options) (source.V
 		return v, nil
 	}
 	v.optionsMu.Unlock()
-	newView, _, err := v.session.updateView(ctx, v, options)
+	newView, err := v.session.updateView(ctx, v, options)
 	return newView, err
 }
 
-func (v *View) Rebuild(ctx context.Context) (source.Snapshot, error) {
-	_, snapshot, err := v.session.updateView(ctx, v, v.Options())
-	return snapshot, err
-}
-
-func (v *View) BuiltinPackage(ctx context.Context) (source.BuiltinPackage, error) {
-	v.awaitInitialized(ctx)
-
-	if v.builtin == nil {
-		return nil, errors.Errorf("no builtin package for view %s", v.name)
-	}
-	data, err := v.builtin.handle.Get(ctx, v)
+func (v *View) Rebuild(ctx context.Context) (source.Snapshot, func(), error) {
+	newView, err := v.session.updateView(ctx, v, v.Options())
 	if err != nil {
-		return nil, err
+		return nil, func() {}, err
 	}
-	if data == nil {
-		return nil, errors.Errorf("unexpected nil builtin package")
-	}
-	d, ok := data.(*builtinPackageData)
-	if !ok {
-		return nil, errors.Errorf("unexpected type %T", data)
-	}
-	if d.err != nil {
-		return nil, d.err
-	}
-	if d.pkg == nil || d.pkg.Scope == nil {
-		return nil, errors.Errorf("no builtin package")
-	}
-	return d, nil
-}
-
-func (v *View) buildBuiltinPackage(ctx context.Context, goFiles []string) error {
-	if len(goFiles) != 1 {
-		return errors.Errorf("only expected 1 file, got %v", len(goFiles))
-	}
-	uri := span.URIFromPath(goFiles[0])
-
-	// Get the FileHandle through the cache to avoid adding it to the snapshot
-	// and to get the file content from disk.
-	fh, err := v.session.cache.getFile(ctx, uri)
-	if err != nil {
-		return err
-	}
-	h := v.session.cache.store.Bind(fh.Identity(), func(ctx context.Context, arg memoize.Arg) interface{} {
-		view := arg.(*View)
-
-		pgh := view.session.cache.parseGoHandle(ctx, fh, source.ParseFull)
-		pgf, _, err := view.parseGo(ctx, pgh)
-		if err != nil {
-			return &builtinPackageData{err: err}
-		}
-		pkg, err := ast.NewPackage(view.session.cache.fset, map[string]*ast.File{
-			pgf.URI.Filename(): pgf.File,
-		}, nil, nil)
-		if err != nil {
-			return &builtinPackageData{err: err}
-		}
-		return &builtinPackageData{
-			pgf: pgf,
-			pkg: pkg,
-		}
-	})
-	v.builtin = &builtinPackageHandle{
-		handle: h,
-	}
-	return nil
+	snapshot, release := newView.Snapshot(ctx)
+	return snapshot, release, nil
 }
 
 func (v *View) WriteEnv(ctx context.Context, w io.Writer) error {
@@ -400,7 +326,7 @@ func (v *View) RunProcessEnvFunc(ctx context.Context, fn func(*imports.Options) 
 		if err != nil {
 			return err
 		}
-		modFileIdentifier = modFH.Identity().Identifier
+		modFileIdentifier = modFH.FileIdentity().Hash
 	}
 	if v.sumURI != "" {
 		sumFH, err = v.session.cache.getFile(ctx, v.sumURI)
@@ -562,15 +488,14 @@ func (v *View) WorkspaceDirectories(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	pmh, err := v.Snapshot().ParseModHandle(ctx, fh)
+	snapshot, release := v.Snapshot(ctx)
+	defer release()
+
+	pm, err := snapshot.ParseMod(ctx, fh)
 	if err != nil {
 		return nil, err
 	}
-	parsed, _, _, err := pmh.Parse(ctx, v.Snapshot())
-	if err != nil {
-		return nil, err
-	}
-	for _, replace := range parsed.Replace {
+	for _, replace := range pm.File.Replace {
 		dirs = append(dirs, replace.New.Path)
 	}
 	return dirs, nil
@@ -661,11 +586,14 @@ func (v *View) shutdown(ctx context.Context) {
 	v.initCancelFirstAttempt()
 
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	if v.cancel != nil {
 		v.cancel()
 		v.cancel = nil
 	}
+	v.mu.Unlock()
+	v.snapshotMu.Lock()
+	go v.snapshot.generation.Destroy()
+	v.snapshotMu.Unlock()
 }
 
 func (v *View) BackgroundContext() context.Context {
@@ -710,8 +638,9 @@ func checkIgnored(suffix string) bool {
 	return false
 }
 
-func (v *View) Snapshot() source.Snapshot {
-	return v.getSnapshot()
+func (v *View) Snapshot(ctx context.Context) (source.Snapshot, func()) {
+	s := v.getSnapshot()
+	return s, s.generation.Acquire(ctx)
 }
 
 func (v *View) getSnapshot() *snapshot {
@@ -768,7 +697,7 @@ func (v *View) awaitInitialized(ctx context.Context) {
 // invalidateContent invalidates the content of a Go file,
 // including any position and type information that depends on it.
 // It returns true if we were already tracking the given file, false otherwise.
-func (v *View) invalidateContent(ctx context.Context, uris map[span.URI]source.FileHandle, forceReloadMetadata bool) source.Snapshot {
+func (v *View) invalidateContent(ctx context.Context, uris map[span.URI]source.VersionedFileHandle, forceReloadMetadata bool) (source.Snapshot, func()) {
 	// Detach the context so that content invalidation cannot be canceled.
 	ctx = xcontext.Detach(ctx)
 
@@ -783,8 +712,11 @@ func (v *View) invalidateContent(ctx context.Context, uris map[span.URI]source.F
 	v.snapshotMu.Lock()
 	defer v.snapshotMu.Unlock()
 
-	v.snapshot = v.snapshot.clone(ctx, uris, forceReloadMetadata)
-	return v.snapshot
+	oldSnapshot := v.snapshot
+	v.snapshot = oldSnapshot.clone(ctx, uris, forceReloadMetadata)
+	go oldSnapshot.generation.Destroy()
+
+	return v.snapshot, v.snapshot.generation.Acquire(ctx)
 }
 
 func (v *View) cancelBackground() {
@@ -811,12 +743,12 @@ func (v *View) maybeReinitialize() {
 	v.initializeOnce = &once
 }
 
-func (v *View) setBuildInformation(ctx context.Context, folder span.URI, env []string, modfileFlagEnabled bool) error {
+func (v *View) setBuildInformation(ctx context.Context, folder span.URI, options source.Options) error {
 	if err := checkPathCase(folder.Filename()); err != nil {
 		return fmt.Errorf("invalid workspace configuration: %w", err)
 	}
 	// Make sure to get the `go env` before continuing with initialization.
-	modFile, err := v.setGoEnv(ctx, env)
+	modFile, err := v.setGoEnv(ctx, options.Env)
 	if err != nil {
 		return err
 	}
@@ -831,7 +763,7 @@ func (v *View) setBuildInformation(ctx context.Context, folder span.URI, env []s
 	}
 
 	v.root = v.folder
-	if v.modURI != "" {
+	if options.ExpandWorkspaceToModule && v.modURI != "" {
 		v.root = span.URIFromPath(filepath.Dir(v.modURI.Filename()))
 	}
 
@@ -840,7 +772,7 @@ func (v *View) setBuildInformation(ctx context.Context, folder span.URI, env []s
 	v.setBuildConfiguration()
 
 	// The user has disabled the use of the -modfile flag or has no go.mod file.
-	if !modfileFlagEnabled || v.modURI == "" {
+	if !options.TempModfile || v.modURI == "" {
 		return nil
 	}
 	if modfileFlag, err := v.modfileFlagExists(ctx, v.Options().Env); err != nil {
@@ -862,9 +794,9 @@ func (v *View) setBuildConfiguration() (isValid bool) {
 	defer func() {
 		v.hasValidBuildConfiguration = isValid
 	}()
-	// Since we only really understand the `go` command, if the user is not
-	// using the go command, assume that their configuration is valid.
-	if !v.goCommand {
+	// Since we only really understand the `go` command, if the user has a
+	// different GOPACKAGESDRIVER, assume that their configuration is valid.
+	if !v.noGopackagesDriver {
 		return true
 	}
 	// Check if the user is working within a module.
@@ -930,7 +862,16 @@ func (v *View) setGoEnv(ctx context.Context, configEnv []string) (string, error)
 
 	// The value of GOPACKAGESDRIVER is not returned through the go command.
 	gopackagesdriver := os.Getenv("GOPACKAGESDRIVER")
-	v.goCommand = gopackagesdriver == "" || gopackagesdriver == "off"
+	for _, s := range configEnv {
+		split := strings.SplitN(s, "=", 2)
+		if split[0] == "GOPACKAGESDRIVER" {
+			gopackagesdriver = split[1]
+		}
+	}
+	// A user may also have a gopackagesdriver binary on their machine, which
+	// works the same way as setting GOPACKAGESDRIVER.
+	tool, _ := exec.LookPath("gopackagesdriver")
+	v.noGopackagesDriver = gopackagesdriver == "off" || (gopackagesdriver == "" && tool == "")
 	return gomod, nil
 }
 

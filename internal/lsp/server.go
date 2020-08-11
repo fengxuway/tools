@@ -14,7 +14,6 @@ import (
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
-	errors "golang.org/x/xerrors"
 )
 
 const concurrentAnalyses = 1
@@ -24,10 +23,12 @@ const concurrentAnalyses = 1
 func NewServer(session source.Session, client protocol.Client) *Server {
 	return &Server{
 		delivered:            make(map[span.URI]sentDiagnostics),
-		gcOptimizatonDetails: make(map[span.URI]bool),
+		gcOptimizatonDetails: make(map[span.URI]struct{}),
+		watchedDirectories:   make(map[span.URI]struct{}),
 		session:              session,
 		client:               client,
 		diagnosticsSema:      make(chan struct{}, concurrentAnalyses),
+		progress:             newProgressTracker(client),
 	}
 }
 
@@ -64,34 +65,39 @@ type Server struct {
 	session source.Session
 
 	// changedFiles tracks files for which there has been a textDocument/didChange.
-	changedFiles map[span.URI]struct{}
+	changedFilesMu sync.Mutex
+	changedFiles   map[span.URI]struct{}
 
 	// folders is only valid between initialize and initialized, and holds the
 	// set of folders to build views for when we are ready
 	pendingFolders []protocol.WorkspaceFolder
 
+	// watchedDirectories is the set of directories that we have requested that
+	// the client watch on disk. It will be updated as the set of directories
+	// that the server should watch changes.
+	watchedDirectoriesMu   sync.Mutex
+	watchedDirectories     map[span.URI]struct{}
+	watchRegistrationCount uint64
+
 	// delivered is a cache of the diagnostics that the server has sent.
 	deliveredMu sync.Mutex
 	delivered   map[span.URI]sentDiagnostics
 
-	// gcOptimizationDetails describes which packages we want optimization details
-	// included in the diagnostics. The key is the directory of the package.
-	gcOptimizatonDetails map[span.URI]bool
+	// gcOptimizationDetails describes the packages for which we want
+	// optimization details to be included in the diagnostics. The key is the
+	// directory of the package.
+	gcOptimizationDetailsMu sync.Mutex
+	gcOptimizatonDetails    map[span.URI]struct{}
 
 	// diagnosticsSema limits the concurrency of diagnostics runs, which can be expensive.
 	diagnosticsSema chan struct{}
 
-	// supportsWorkDoneProgress is set in the initializeRequest
-	// to determine if the client can support progress notifications
-	supportsWorkDoneProgress bool
-	inProgressMu             sync.Mutex
-	inProgress               map[string]*WorkDone
+	progress *progressTracker
 }
 
 // sentDiagnostics is used to cache diagnostics that have been sent for a given file.
 type sentDiagnostics struct {
-	version      float64
-	identifier   string
+	id           source.VersionedFileIdentity
 	sorted       []*source.Diagnostic
 	withAnalysis bool
 	snapshotID   uint64
@@ -101,7 +107,8 @@ func (s *Server) nonstandardRequest(ctx context.Context, method string, params i
 	paramMap := params.(map[string]interface{})
 	if method == "gopls/diagnoseFiles" {
 		for _, file := range paramMap["files"].([]interface{}) {
-			snapshot, fh, ok, err := s.beginFileRequest(ctx, protocol.DocumentURI(file.(string)), source.UnknownKind)
+			snapshot, fh, ok, release, err := s.beginFileRequest(ctx, protocol.DocumentURI(file.(string)), source.UnknownKind)
+			defer release()
 			if !ok {
 				return nil, err
 			}
@@ -126,36 +133,6 @@ func (s *Server) nonstandardRequest(ctx context.Context, method string, params i
 		return struct{}{}, nil
 	}
 	return nil, notImplemented(method)
-}
-
-func (s *Server) workDoneProgressCancel(ctx context.Context, params *protocol.WorkDoneProgressCancelParams) error {
-	token, ok := params.Token.(string)
-	if !ok {
-		return errors.Errorf("expected params.Token to be string but got %T", params.Token)
-	}
-	s.inProgressMu.Lock()
-	defer s.inProgressMu.Unlock()
-	wd, ok := s.inProgress[token]
-	if !ok {
-		return errors.Errorf("token %q not found in progress", token)
-	}
-	if wd.cancel == nil {
-		return errors.Errorf("work %q is not cancellable", token)
-	}
-	wd.cancel()
-	return nil
-}
-
-func (s *Server) addInProgress(wd *WorkDone) {
-	s.inProgressMu.Lock()
-	s.inProgress[wd.token] = wd
-	s.inProgressMu.Unlock()
-}
-
-func (s *Server) removeInProgress(token string) {
-	s.inProgressMu.Lock()
-	delete(s.inProgress, token)
-	s.inProgressMu.Unlock()
 }
 
 func notImplemented(method string) error {

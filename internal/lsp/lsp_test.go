@@ -54,7 +54,8 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 		options := tests.DefaultOptions()
 		session.SetOptions(options)
 		options.Env = datum.Config.Env
-		view, snapshot, err := session.NewView(ctx, datum.Config.Dir, span.URIFromPath(datum.Config.Dir), options)
+		view, _, release, err := session.NewView(ctx, datum.Config.Dir, span.URIFromPath(datum.Config.Dir), options)
+		release()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -63,7 +64,7 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 
 		// Enable type error analyses for tests.
 		// TODO(golang/go#38212): Delete this once they are enabled by default.
-		tests.EnableAllAnalyzers(snapshot, &options)
+		tests.EnableAllAnalyzers(view, &options)
 		view.SetOptions(ctx, options)
 
 		// Only run the -modfile specific tests in module mode with Go 1.14 or above.
@@ -83,7 +84,7 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 				LanguageID: "go",
 			})
 		}
-		if _, err := session.DidModifyFiles(ctx, modifications); err != nil {
+		if err := session.ModifyFiles(ctx, modifications); err != nil {
 			t.Fatal(err)
 		}
 		r := &runner{
@@ -98,6 +99,50 @@ func testLSP(t *testing.T, exporter packagestest.Exporter) {
 	}
 }
 
+func (r *runner) CallHierarchy(t *testing.T, spn span.Span, expectedCalls *tests.CallHierarchyResult) {
+	mapper, err := r.data.Mapper(spn.URI())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc, err := mapper.Location(spn)
+	if err != nil {
+		t.Fatalf("failed for %v: %v", spn, err)
+	}
+
+	params := &protocol.CallHierarchyPrepareParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: loc.URI},
+			Position:     loc.Range.Start,
+		},
+	}
+
+	items, err := r.server.PrepareCallHierarchy(r.ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) == 0 {
+		t.Errorf("expected call hierarchy item to be returned for identifier at %v\n", loc.Range)
+	}
+
+	callLocation := protocol.Location{
+		URI:   items[0].URI,
+		Range: items[0].Range,
+	}
+	if callLocation != loc {
+		t.Errorf("expected server.PrepareCallHierarchy to return identifier at %v but got %v\n", loc, callLocation)
+	}
+
+	// TODO: add span comparison tests for expectedCalls once call hierarchy is implemented
+	incomingCalls, err := r.server.IncomingCalls(r.ctx, &protocol.CallHierarchyIncomingCallsParams{Item: items[0]})
+	if len(incomingCalls) != 0 {
+		t.Errorf("expected no incoming calls but got %d", len(incomingCalls))
+	}
+	outgoingCalls, err := r.server.OutgoingCalls(r.ctx, &protocol.CallHierarchyOutgoingCallsParams{Item: items[0]})
+	if len(outgoingCalls) != 0 {
+		t.Errorf("expected no outgoing calls but got %d", len(outgoingCalls))
+	}
+}
+
 func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens) {
 	if source.DetectLanguage("", uri.Filename()) != source.Mod {
 		return
@@ -106,7 +151,9 @@ func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := mod.CodeLens(r.ctx, v.Snapshot(), uri)
+	snapshot, release := v.Snapshot(r.ctx)
+	defer release()
+	got, err := mod.CodeLens(r.ctx, snapshot, uri)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +168,9 @@ func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []*source.Diagnost
 		r.diagnostics = make(map[span.URI]map[string]*source.Diagnostic)
 		v := r.server.session.View(r.data.Config.Dir)
 		// Always run diagnostics with analysis.
-		reports, _ := r.server.diagnose(r.ctx, v.Snapshot(), true)
+		snapshot, release := v.Snapshot(r.ctx)
+		defer release()
+		reports, _ := r.server.diagnose(r.ctx, snapshot, true)
 		for key, diags := range reports {
 			r.diagnostics[key.id.URI] = diags
 		}
@@ -373,7 +422,10 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := view.Snapshot()
+
+	snapshot, release := view.Snapshot(r.ctx)
+	defer release()
+
 	fh, err := snapshot.GetFile(r.ctx, uri)
 	if err != nil {
 		t.Fatal(err)
@@ -390,7 +442,9 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 	if r.diagnostics == nil {
 		r.diagnostics = make(map[span.URI]map[string]*source.Diagnostic)
 		// Always run diagnostics with analysis.
-		reports, _ := r.server.diagnose(r.ctx, view.Snapshot(), true)
+		snapshot, release := view.Snapshot(r.ctx)
+		defer release()
+		reports, _ := r.server.diagnose(r.ctx, snapshot, true)
 		for key, diags := range reports {
 			r.diagnostics[key.id.URI] = diags
 		}
@@ -464,7 +518,7 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 	}
 }
 
-func commandToEdits(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle, rng protocol.Range, cmd string) ([]protocol.TextDocumentEdit, error) {
+func commandToEdits(ctx context.Context, snapshot source.Snapshot, fh source.VersionedFileHandle, rng protocol.Range, cmd string) ([]protocol.TextDocumentEdit, error) {
 	var command *source.Command
 	for _, c := range source.Commands {
 		if c.Name == cmd {
@@ -476,14 +530,22 @@ func commandToEdits(ctx context.Context, snapshot source.Snapshot, fh source.Fil
 		return nil, fmt.Errorf("no known command for %s", cmd)
 	}
 	if !command.Applies(ctx, snapshot, fh, rng) {
-		return nil, nil
+		return nil, fmt.Errorf("cannot apply %v", command.Name)
 	}
 	return command.SuggestedFix(ctx, snapshot, fh, rng)
 }
 
 func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span) {
 	uri := start.URI()
-	_, err := r.server.session.ViewOf(uri)
+	view, err := r.server.session.ViewOf(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, release := view.Snapshot(r.ctx)
+	defer release()
+
+	fh, err := snapshot.GetFile(r.ctx, uri)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +575,11 @@ func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span
 	if len(actions) == 0 || len(actions) > 1 {
 		t.Fatalf("unexpected number of code actions, want 1, got %v", len(actions))
 	}
-	res, err := applyTextDocumentEdits(r, actions[0].Edit.DocumentChanges)
+	edits, err := commandToEdits(r.ctx, snapshot, fh, rng, actions[0].Command.Command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := applyTextDocumentEdits(r, edits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -848,9 +914,21 @@ func applyTextDocumentEdits(r *runner, edits []protocol.TextDocumentEdit) (map[s
 	res := map[span.URI]string{}
 	for _, docEdits := range edits {
 		uri := docEdits.TextDocument.URI.SpanURI()
-		m, err := r.data.Mapper(uri)
-		if err != nil {
-			return nil, err
+		var m *protocol.ColumnMapper
+		// If we have already edited this file, we use the edited version (rather than the
+		// file in its original state) so that we preserve our initial changes.
+		if content, ok := res[uri]; ok {
+			m = &protocol.ColumnMapper{
+				URI: uri,
+				Converter: span.NewContentConverter(
+					uri.Filename(), []byte(content)),
+				Content: []byte(content),
+			}
+		} else {
+			var err error
+			if m, err = r.data.Mapper(uri); err != nil {
+				return nil, err
+			}
 		}
 		res[uri] = string(m.Content)
 		sedits, err := source.FromProtocolEdits(m, docEdits.Edits)

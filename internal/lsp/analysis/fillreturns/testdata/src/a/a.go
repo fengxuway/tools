@@ -6,6 +6,7 @@ package fillreturns
 
 import (
 	"errors"
+	"go/ast"
 	ast2 "go/ast"
 	"io"
 	"net/http"
@@ -110,4 +111,27 @@ func localFuncMultipleReturn() (string, int, error, string) {
 
 func multipleUnused() (int, string, string, string) {
 	return 3, 4, 5 // want "wrong number of return values \\(want 4, got 3\\)"
+}
+
+func gotTooMany() int {
+	if true {
+		return 0, "" // want "wrong number of return values \\(want 1, got 2\\)"
+	} else {
+		return 1, 0, nil // want "wrong number of return values \\(want 1, got 3\\)"
+	}
+	return 0, 5, false // want "wrong number of return values \\(want 1, got 3\\)"
+}
+
+func fillVars() (int, string, ast.Node, bool, error) {
+	eint := 0
+	s := "a"
+	var t bool
+	if true {
+		err := errors.New("fail")
+		return // want "wrong number of return values \\(want 5, got 0\\)"
+	}
+	n := ast.NewIdent("ident")
+	int := 3
+	var b bool
+	return "" // want "wrong number of return values \\(want 5, got 1\\)"
 }

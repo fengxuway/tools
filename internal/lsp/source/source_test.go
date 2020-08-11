@@ -37,9 +37,10 @@ func TestSource(t *testing.T) {
 }
 
 type runner struct {
-	view source.View
-	data *tests.Data
-	ctx  context.Context
+	snapshot source.Snapshot
+	view     source.View
+	data     *tests.Data
+	ctx      context.Context
 }
 
 func testSource(t *testing.T, exporter packagestest.Exporter) {
@@ -52,7 +53,8 @@ func testSource(t *testing.T, exporter packagestest.Exporter) {
 		session := cache.NewSession(ctx)
 		options := tests.DefaultOptions()
 		options.Env = datum.Config.Env
-		view, snapshot, err := session.NewView(ctx, "source_test", span.URIFromPath(datum.Config.Dir), options)
+		view, _, release, err := session.NewView(ctx, "source_test", span.URIFromPath(datum.Config.Dir), options)
+		release()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -60,13 +62,8 @@ func testSource(t *testing.T, exporter packagestest.Exporter) {
 
 		// Enable type error analyses for tests.
 		// TODO(golang/go#38212): Delete this once they are enabled by default.
-		tests.EnableAllAnalyzers(snapshot, &options)
+		tests.EnableAllAnalyzers(view, &options)
 		view.SetOptions(ctx, options)
-		r := &runner{
-			view: view,
-			data: datum,
-			ctx:  ctx,
-		}
 		var modifications []source.FileModification
 		for filename, content := range datum.Config.Overlay {
 			kind := source.DetectLanguage("", filename)
@@ -81,8 +78,16 @@ func testSource(t *testing.T, exporter packagestest.Exporter) {
 				LanguageID: "go",
 			})
 		}
-		if _, err := session.DidModifyFiles(ctx, modifications); err != nil {
+		if err := session.ModifyFiles(ctx, modifications); err != nil {
 			t.Fatal(err)
+		}
+		snapshot, release := view.Snapshot(ctx)
+		defer release()
+		r := &runner{
+			view:     view,
+			snapshot: snapshot,
+			data:     datum,
+			ctx:      ctx,
 		}
 		t.Run(tests.FormatFolderName(datum.Folder), func(t *testing.T) {
 			t.Helper()
@@ -91,10 +96,49 @@ func testSource(t *testing.T, exporter packagestest.Exporter) {
 	}
 }
 
-func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []*source.Diagnostic) {
-	snapshot := r.view.Snapshot()
+func (r *runner) CallHierarchy(t *testing.T, spn span.Span, expectedCalls *tests.CallHierarchyResult) {
+	mapper, err := r.data.Mapper(spn.URI())
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc, err := mapper.Location(spn)
+	if err != nil {
+		t.Fatalf("failed for %v: %v", spn, err)
+	}
+	fh, err := r.snapshot.GetFile(r.ctx, spn.URI())
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	fileID, got, err := source.FileDiagnostics(r.ctx, snapshot, uri)
+	items, err := source.PrepareCallHierarchy(r.ctx, r.snapshot, fh, loc.Range.Start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) == 0 {
+		t.Errorf("expected call hierarchy item to be returned for identifier at %v\n", loc.Range)
+	}
+
+	callLocation := protocol.Location{
+		URI:   items[0].URI,
+		Range: items[0].Range,
+	}
+	if callLocation != loc {
+		t.Errorf("expected source.PrepareCallHierarchy to return identifier at %v but got %v\n", loc, callLocation)
+	}
+
+	// TODO: add span comparison tests for expectedCalls once call hierarchy is implemented
+	incomingCalls, err := source.IncomingCalls(r.ctx, r.snapshot, fh, loc.Range.Start)
+	if len(incomingCalls) != 0 {
+		t.Errorf("expected no incoming calls but got %d", len(incomingCalls))
+	}
+	outgoingCalls, err := source.OutgoingCalls(r.ctx, r.snapshot, fh, loc.Range.Start)
+	if len(outgoingCalls) != 0 {
+		t.Errorf("expected no outgoing calls but got %d", len(outgoingCalls))
+	}
+}
+
+func (r *runner) Diagnostics(t *testing.T, uri span.URI, want []*source.Diagnostic) {
+	fileID, got, err := source.FileDiagnostics(r.ctx, r.snapshot, uri)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,20 +272,23 @@ func (r *runner) RankCompletion(t *testing.T, src span.Span, test tests.Completi
 }
 
 func (r *runner) callCompletion(t *testing.T, src span.Span, options func(*source.Options)) (string, []protocol.CompletionItem) {
-	fh, err := r.view.Snapshot().GetFile(r.ctx, src.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, src.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
 	original := r.view.Options()
 	modified := original
 	options(&modified)
-	view, err := r.view.SetOptions(r.ctx, modified)
+	newView, err := r.view.SetOptions(r.ctx, modified)
+	if newView != r.view {
+		t.Fatalf("options change unexpectedly created new view")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.view.SetOptions(r.ctx, original)
 
-	list, surrounding, err := source.Completion(r.ctx, view.Snapshot(), fh, protocol.Position{
+	list, surrounding, err := source.Completion(r.ctx, r.snapshot, fh, protocol.Position{
 		Line:      float64(src.Start().Line() - 1),
 		Character: float64(src.Start().Column() - 1),
 	})
@@ -274,7 +321,7 @@ func (r *runner) callCompletion(t *testing.T, src span.Span, options func(*sourc
 func (r *runner) FoldingRanges(t *testing.T, spn span.Span) {
 	uri := spn.URI()
 
-	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +332,7 @@ func (r *runner) FoldingRanges(t *testing.T, spn span.Span) {
 	}
 
 	// Test all folding ranges.
-	ranges, err := source.FoldingRange(r.ctx, r.view.Snapshot(), fh, false)
+	ranges, err := source.FoldingRange(r.ctx, r.snapshot, fh, false)
 	if err != nil {
 		t.Error(err)
 		return
@@ -293,7 +340,7 @@ func (r *runner) FoldingRanges(t *testing.T, spn span.Span) {
 	r.foldingRanges(t, "foldingRange", uri, string(data), ranges)
 
 	// Test folding ranges with lineFoldingOnly
-	ranges, err = source.FoldingRange(r.ctx, r.view.Snapshot(), fh, true)
+	ranges, err = source.FoldingRange(r.ctx, r.snapshot, fh, true)
 	if err != nil {
 		t.Error(err)
 		return
@@ -414,11 +461,11 @@ func (r *runner) Format(t *testing.T, spn span.Span) {
 		out, _ := cmd.Output() // ignore error, sometimes we have intentionally ungofmt-able files
 		return out, nil
 	}))
-	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	edits, err := source.Format(r.ctx, r.view.Snapshot(), fh)
+	edits, err := source.Format(r.ctx, r.snapshot, fh)
 	if err != nil {
 		if gofmted != "" {
 			t.Error(err)
@@ -444,11 +491,11 @@ func (r *runner) Format(t *testing.T, spn span.Span) {
 }
 
 func (r *runner) Import(t *testing.T, spn span.Span) {
-	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	edits, _, err := source.AllImportsFixes(r.ctx, r.view.Snapshot(), fh)
+	edits, _, err := source.AllImportsFixes(r.ctx, r.snapshot, fh)
 	if err != nil {
 		t.Error(err)
 	}
@@ -479,11 +526,11 @@ func (r *runner) Definition(t *testing.T, spn span.Span, d tests.Definition) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ident, err := source.Identifier(r.ctx, r.view.Snapshot(), fh, srcRng.Start)
+	ident, err := source.Identifier(r.ctx, r.snapshot, fh, srcRng.Start)
 	if err != nil {
 		t.Fatalf("failed for %v: %v", d.Src, err)
 	}
@@ -539,11 +586,11 @@ func (r *runner) Implementation(t *testing.T, spn span.Span, impls []span.Span) 
 	if err != nil {
 		t.Fatalf("failed for %v: %v", spn, err)
 	}
-	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	locs, err := source.Implementation(r.ctx, r.view.Snapshot(), fh, loc.Range.Start)
+	locs, err := source.Implementation(r.ctx, r.snapshot, fh, loc.Range.Start)
 	if err != nil {
 		t.Fatalf("failed for %v: %v", spn, err)
 	}
@@ -583,11 +630,11 @@ func (r *runner) Highlight(t *testing.T, src span.Span, locations []span.Span) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh, err := r.view.Snapshot().GetFile(r.ctx, src.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, src.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	highlights, err := source.Highlight(ctx, r.view.Snapshot(), fh, srcRng.Start)
+	highlights, err := source.Highlight(ctx, r.snapshot, fh, srcRng.Start)
 	if err != nil {
 		t.Errorf("highlight failed for %s: %v", src.URI(), err)
 	}
@@ -621,7 +668,7 @@ func (r *runner) References(t *testing.T, src span.Span, itemList []span.Span) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := r.view.Snapshot()
+	snapshot := r.snapshot
 	fh, err := snapshot.GetFile(r.ctx, src.URI())
 	if err != nil {
 		t.Fatal(err)
@@ -667,11 +714,11 @@ func (r *runner) Rename(t *testing.T, spn span.Span, newText string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	changes, err := source.Rename(r.ctx, r.view.Snapshot(), fh, srcRng.Start, newText)
+	changes, err := source.Rename(r.ctx, r.snapshot, fh, srcRng.Start, newText)
 	if err != nil {
 		renamed := string(r.data.Golden(tag, spn.URI().Filename(), func() ([]byte, error) {
 			return []byte(err.Error()), nil
@@ -684,7 +731,7 @@ func (r *runner) Rename(t *testing.T, spn span.Span, newText string) {
 
 	var res []string
 	for editURI, edits := range changes {
-		fh, err := r.view.Snapshot().GetFile(r.ctx, editURI)
+		fh, err := r.snapshot.GetFile(r.ctx, editURI)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -749,11 +796,11 @@ func (r *runner) PrepareRename(t *testing.T, src span.Span, want *source.Prepare
 		t.Fatal(err)
 	}
 	// Find the identifier at the position.
-	fh, err := r.view.Snapshot().GetFile(r.ctx, src.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, src.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := source.PrepareRename(r.ctx, r.view.Snapshot(), fh, srcRng.Start)
+	item, err := source.PrepareRename(r.ctx, r.snapshot, fh, srcRng.Start)
 	if err != nil {
 		if want.Text != "" { // expected an ident.
 			t.Errorf("prepare rename failed for %v: got error: %v", src, err)
@@ -784,11 +831,11 @@ func (r *runner) PrepareRename(t *testing.T, src span.Span, want *source.Prepare
 }
 
 func (r *runner) Symbols(t *testing.T, uri span.URI, expectedSymbols []protocol.DocumentSymbol) {
-	fh, err := r.view.Snapshot().GetFile(r.ctx, uri)
+	fh, err := r.snapshot.GetFile(r.ctx, uri)
 	if err != nil {
 		t.Fatal(err)
 	}
-	symbols, err := source.DocumentSymbols(r.ctx, r.view.Snapshot(), fh)
+	symbols, err := source.DocumentSymbols(r.ctx, r.snapshot, fh)
 	if err != nil {
 		t.Errorf("symbols failed for %s: %v", uri, err)
 	}
@@ -830,11 +877,11 @@ func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.Signa
 	if err != nil {
 		t.Fatal(err)
 	}
-	fh, err := r.view.Snapshot().GetFile(r.ctx, spn.URI())
+	fh, err := r.snapshot.GetFile(r.ctx, spn.URI())
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotSignature, gotActiveParameter, err := source.SignatureHelp(r.ctx, r.view.Snapshot(), fh, rng.Start)
+	gotSignature, gotActiveParameter, err := source.SignatureHelp(r.ctx, r.snapshot, fh, rng.Start)
 	if err != nil {
 		// Only fail if we got an error we did not expect.
 		if want != nil {
@@ -863,11 +910,11 @@ func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)
 func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span) {}
 
 func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens) {
-	fh, err := r.view.Snapshot().GetFile(r.ctx, uri)
+	fh, err := r.snapshot.GetFile(r.ctx, uri)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := source.CodeLens(r.ctx, r.view.Snapshot(), fh)
+	got, err := source.CodeLens(r.ctx, r.snapshot, fh)
 	if err != nil {
 		t.Fatal(err)
 	}

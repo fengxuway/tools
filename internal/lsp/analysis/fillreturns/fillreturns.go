@@ -89,7 +89,7 @@ outer:
 			return nil, nil
 		}
 
-		// Get the function that encloses the ReturnStmt.
+		// Get the function type that encloses the ReturnStmt.
 		var enclosingFunc *ast.FuncType
 		for _, n := range path {
 			switch node := n.(type) {
@@ -104,6 +104,18 @@ outer:
 		}
 		if enclosingFunc == nil {
 			continue
+		}
+
+		// Find the function declaration that encloses the ReturnStmt.
+		var outer *ast.FuncDecl
+		for _, p := range path {
+			if p, ok := p.(*ast.FuncDecl); ok {
+				outer = p
+				break
+			}
+		}
+		if outer == nil {
+			return nil, nil
 		}
 
 		// Skip any return statements that contain function calls with multiple return values.
@@ -126,33 +138,61 @@ outer:
 		// For each value in the return function declaration, find the leftmost element
 		// in the return statement that has the desired type. If no such element exits,
 		// fill in the missing value with the appropriate "zero" value.
-		for i, result := range enclosingFunc.Results.List {
-			typ := info.TypeOf(result.Type)
-
+		var retTyps []types.Type
+		for _, ret := range enclosingFunc.Results.List {
+			retTyps = append(retTyps, info.TypeOf(ret.Type))
+		}
+		matches :=
+			analysisinternal.FindMatchingIdents(retTyps, file, ret.Pos(), info, pass.Pkg)
+		for i, retTyp := range retTyps {
 			var match ast.Expr
 			var idx int
 			for j, val := range remaining {
-				if !matchingTypes(info.TypeOf(val), typ) {
+				if !matchingTypes(info.TypeOf(val), retTyp) {
 					continue
 				}
+				if !analysisinternal.IsZeroValue(val) {
+					match, idx = val, j
+					break
+				}
+				// If the current match is a "zero" value, we keep searching in
+				// case we find a non-"zero" value match. If we do not find a
+				// non-"zero" value, we will use the "zero" value.
 				match, idx = val, j
-				break
 			}
 
 			if match != nil {
 				fixed[i] = match
 				remaining = append(remaining[:idx], remaining[idx+1:]...)
 			} else {
-				zv := analysisinternal.ZeroValue(pass.Fset, file, pass.Pkg, info.TypeOf(result.Type))
-				if zv == nil {
+				idents, ok := matches[retTyp]
+				if !ok {
+					return nil, fmt.Errorf("invalid return type: %v", retTyp)
+				}
+				// Find the identifer whose name is most similar to the return type.
+				// If we do not find any identifer that matches the pattern,
+				// generate a zero value.
+				value := analysisinternal.FindBestMatch(retTyp.String(), idents)
+				if value == nil {
+					value = analysisinternal.ZeroValue(
+						pass.Fset, file, pass.Pkg, retTyp)
+				}
+				if value == nil {
 					return nil, nil
 				}
-				fixed[i] = zv
+				fixed[i] = value
 			}
 		}
 
+		// Remove any non-matching "zero values" from the leftover values.
+		var nonZeroRemaining []ast.Expr
+		for _, expr := range remaining {
+			if !analysisinternal.IsZeroValue(expr) {
+				nonZeroRemaining = append(nonZeroRemaining, expr)
+			}
+		}
 		// Append leftover return values to end of new return statement.
-		fixed = append(fixed, remaining...)
+		fixed = append(fixed, nonZeroRemaining...)
 
 		newRet := &ast.ReturnStmt{
 			Return:  ret.Pos(),
@@ -200,14 +240,11 @@ func FixesError(msg string) bool {
 	if len(matches) < 3 {
 		return false
 	}
-	wantNum, err := strconv.Atoi(matches[1])
-	if err != nil {
+	if _, err := strconv.Atoi(matches[1]); err != nil {
 		return false
 	}
-	gotNum, err := strconv.Atoi(matches[2])
-	if err != nil {
+	if _, err := strconv.Atoi(matches[2]); err != nil {
 		return false
 	}
-	// Logic for handling more return values than expected is hard.
-	return wantNum >= gotNum
+	return true
 }

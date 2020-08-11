@@ -51,8 +51,6 @@ func (ph *packageHandle) packageKey() packageKey {
 
 // packageData contains the data produced by type-checking a package.
 type packageData struct {
-	memoize.NoCopy
-
 	pkg *pkg
 	err error
 }
@@ -80,18 +78,24 @@ func (s *snapshot) buildPackageHandle(ctx context.Context, id packageID, mode so
 	m := ph.m
 	key := ph.key
 
-	h := s.view.session.cache.store.Bind(key, func(ctx context.Context, arg memoize.Arg) interface{} {
+	h := s.generation.Bind(key, func(ctx context.Context, arg memoize.Arg) interface{} {
 		snapshot := arg.(*snapshot)
 
 		// Begin loading the direct dependencies, in parallel.
+		var wg sync.WaitGroup
 		for _, dep := range deps {
+			wg.Add(1)
 			go func(dep *packageHandle) {
 				dep.check(ctx, snapshot)
+				wg.Done()
 			}(dep)
 		}
 
 		data := &packageData{}
 		data.pkg, data.err = typeCheck(ctx, snapshot, m, mode, deps)
+		// Make sure that the workers above have finished before we return,
+		// especially in case of cancellation.
+		wg.Wait()
 
 		return data
 	})
@@ -168,7 +172,8 @@ func checkPackageKey(ctx context.Context, id packageID, pghs []*parseGoHandle, c
 		b.WriteString(string(dep))
 	}
 	for _, cgf := range pghs {
-		b.WriteString(cgf.file.Identity().String())
+		b.WriteString(string(cgf.file.URI()))
+		b.WriteString(cgf.file.FileIdentity().Hash)
 	}
 	return packageHandleKey(hashContents(b.Bytes()))
 }
@@ -195,7 +200,7 @@ func (ph *packageHandle) Check(ctx context.Context, s source.Snapshot) (source.P
 }
 
 func (ph *packageHandle) check(ctx context.Context, s *snapshot) (*pkg, error) {
-	v, err := ph.handle.Get(ctx, s)
+	v, err := ph.handle.Get(ctx, s.generation, s)
 	if err != nil {
 		return nil, err
 	}
@@ -211,12 +216,8 @@ func (ph *packageHandle) ID() string {
 	return string(ph.m.id)
 }
 
-func (ph *packageHandle) Cached() (source.Package, error) {
-	return ph.cached()
-}
-
-func (ph *packageHandle) cached() (*pkg, error) {
-	v := ph.handle.Cached()
+func (ph *packageHandle) cached(g *memoize.Generation) (*pkg, error) {
+	v := ph.handle.Cached(g)
 	if v == nil {
 		return nil, errors.Errorf("no cached type information for %s", ph.m.pkgPath)
 	}
@@ -231,7 +232,7 @@ func (s *snapshot) parseGoHandles(ctx context.Context, files []span.URI, mode so
 		if err != nil {
 			return nil, err
 		}
-		pghs = append(pghs, s.view.session.cache.parseGoHandle(ctx, fh, mode))
+		pghs = append(pghs, s.parseGoHandle(ctx, fh, mode))
 	}
 	return pghs, nil
 }
@@ -281,8 +282,8 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 				actualErrors[i] = err
 				return
 			}
-			pgh := snapshot.view.session.cache.parseGoHandle(ctx, fh, mode)
-			pgf, fixed, err := snapshot.view.parseGo(ctx, pgh)
+			pgh := snapshot.parseGoHandle(ctx, fh, mode)
+			pgf, fixed, err := snapshot.parseGo(ctx, pgh)
 			if err != nil {
 				actualErrors[i] = err
 				return

@@ -82,7 +82,7 @@ func HoverIdentifier(ctx context.Context, i *IdentifierInfo) (*HoverInformation,
 	ctx, done := event.Start(ctx, "source.Hover")
 	defer done()
 
-	fset := i.Snapshot.View().Session().Cache().FileSet()
+	fset := i.Snapshot.FileSet()
 	h, err := hover(ctx, fset, i.pkg, i.Declaration)
 	if err != nil {
 		return nil, err
@@ -166,7 +166,7 @@ func pathLinkAndSymbolName(i *IdentifierInfo) (string, string, string) {
 				// exported (we may have an interface or struct we can link
 				// to). If not, don't show any link.
 				if !rtyp.Obj().Exported() {
-					if named := i.enclosing.(*types.Named); ok && named.Obj().Exported() {
+					if named, ok := i.enclosing.(*types.Named); ok && named.Obj().Exported() {
 						rTypeName = named.Obj().Name()
 					} else {
 						return "", "", ""

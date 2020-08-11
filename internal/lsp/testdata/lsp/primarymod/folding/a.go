@@ -28,7 +28,8 @@ func bar() string {
 		3,
 	}
 	_ = [2]string{"d",
-		"e"}
+		"e"
+	}
 	_ = map[string]int{
 		"a": 1,
 		"b": 2,
@@ -43,6 +44,19 @@ func bar() string {
 		f: "j",
 		g: 4,
 		h: "i",
+	}
+	x, y := make(chan bool), make(chan bool)
+	select {
+	case val := <-x:
+		if val {
+			fmt.Println("true from x")
+		} else {
+			fmt.Println("false from x")
+		}
+	case <-y:
+		fmt.Println("y")
+	default:
+		fmt.Println("default")
 	}
 	// This is a multiline comment
 	// that is not a doc comment.

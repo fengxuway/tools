@@ -20,7 +20,8 @@ import (
 )
 
 func (s *Server) codeAction(ctx context.Context, params *protocol.CodeActionParams) ([]protocol.CodeAction, error) {
-	snapshot, fh, ok, err := s.beginFileRequest(ctx, params.TextDocument.URI, source.UnknownKind)
+	snapshot, fh, ok, release, err := s.beginFileRequest(ctx, params.TextDocument.URI, source.UnknownKind)
+	defer release()
 	if !ok {
 		return nil, err
 	}
@@ -315,7 +316,7 @@ func findSourceError(ctx context.Context, snapshot source.Snapshot, pkgID string
 func diagnosticToAnalyzer(snapshot source.Snapshot, src, msg string) (analyzer *source.Analyzer) {
 	// Make sure that the analyzer we found is enabled.
 	defer func() {
-		if analyzer != nil && !analyzer.Enabled(snapshot) {
+		if analyzer != nil && !analyzer.Enabled(snapshot.View()) {
 			analyzer = nil
 		}
 	}()
@@ -344,7 +345,7 @@ func diagnosticToAnalyzer(snapshot source.Snapshot, src, msg string) (analyzer *
 func convenienceFixes(ctx context.Context, snapshot source.Snapshot, pkg source.Package, uri span.URI, rng protocol.Range) ([]protocol.CodeAction, error) {
 	var analyzers []*analysis.Analyzer
 	for _, a := range snapshot.View().Options().ConvenienceAnalyzers {
-		if !a.Enabled(snapshot) {
+		if !a.Enabled(snapshot.View()) {
 			continue
 		}
 		if a.Command == nil {
@@ -431,7 +432,7 @@ func extractionFixes(ctx context.Context, snapshot source.Snapshot, pkg source.P
 			Title: command.Title,
 			Kind:  protocol.RefactorExtract,
 			Command: &protocol.Command{
-				Command:   source.CommandExtractFunction.Name,
+				Command:   command.Name,
 				Arguments: jsonArgs,
 			},
 		})
@@ -439,7 +440,7 @@ func extractionFixes(ctx context.Context, snapshot source.Snapshot, pkg source.P
 	return actions, nil
 }
 
-func documentChanges(fh source.FileHandle, edits []protocol.TextEdit) []protocol.TextDocumentEdit {
+func documentChanges(fh source.VersionedFileHandle, edits []protocol.TextEdit) []protocol.TextDocumentEdit {
 	return []protocol.TextDocumentEdit{
 		{
 			TextDocument: protocol.VersionedTextDocumentIdentifier{
@@ -454,20 +455,19 @@ func documentChanges(fh source.FileHandle, edits []protocol.TextEdit) []protocol
 }
 
 func moduleQuickFixes(ctx context.Context, snapshot source.Snapshot, diagnostics []protocol.Diagnostic) ([]protocol.CodeAction, error) {
-	mth, err := snapshot.ModTidyHandle(ctx)
+	modFH, err := snapshot.GetFile(ctx, snapshot.View().ModFile())
+	if err != nil {
+		return nil, err
+	}
+	tidied, err := snapshot.ModTidy(ctx)
 	if err == source.ErrTmpModfileUnsupported {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	errors, err := mth.Tidy(ctx, snapshot)
-	if err != nil {
-		return nil, err
-	}
-	pmh := mth.ParseModHandle()
 	var quickFixes []protocol.CodeAction
-	for _, e := range errors {
+	for _, e := range tidied.Errors {
 		var diag *protocol.Diagnostic
 		for _, d := range diagnostics {
 			if sameDiagnostic(d, e) {
@@ -486,14 +486,14 @@ func moduleQuickFixes(ctx context.Context, snapshot source.Snapshot, diagnostics
 				Edit:        protocol.WorkspaceEdit{},
 			}
 			for uri, edits := range fix.Edits {
-				if uri != pmh.Mod().URI() {
+				if uri != modFH.URI() {
 					continue
 				}
 				action.Edit.DocumentChanges = append(action.Edit.DocumentChanges, protocol.TextDocumentEdit{
 					TextDocument: protocol.VersionedTextDocumentIdentifier{
-						Version: pmh.Mod().Version(),
+						Version: modFH.Version(),
 						TextDocumentIdentifier: protocol.TextDocumentIdentifier{
-							URI: protocol.URIFromSpanURI(pmh.Mod().URI()),
+							URI: protocol.URIFromSpanURI(modFH.URI()),
 						},
 					},
 					Edits: edits,
@@ -510,25 +510,21 @@ func sameDiagnostic(d protocol.Diagnostic, e source.Error) bool {
 }
 
 func goModTidy(ctx context.Context, snapshot source.Snapshot) (*protocol.CodeAction, error) {
-	mth, err := snapshot.ModTidyHandle(ctx)
+	tidied, err := snapshot.ModTidy(ctx)
 	if err != nil {
 		return nil, err
 	}
-	uri := mth.ParseModHandle().Mod().URI()
-	_, m, _, err := mth.ParseModHandle().Parse(ctx, snapshot)
+	modFH, err := snapshot.GetFile(ctx, snapshot.View().ModFile())
 	if err != nil {
 		return nil, err
 	}
-	left, err := mth.ParseModHandle().Mod().Read()
+	left, err := modFH.Read()
 	if err != nil {
 		return nil, err
 	}
-	right, err := mth.TidiedContent(ctx, snapshot)
-	if err != nil {
-		return nil, err
-	}
-	edits := snapshot.View().Options().ComputeEdits(uri, string(left), string(right))
-	protocolEdits, err := source.ToProtocolEdits(m, edits)
+	right := tidied.TidiedContent
+	edits := snapshot.View().Options().ComputeEdits(modFH.URI(), string(left), string(right))
+	protocolEdits, err := source.ToProtocolEdits(tidied.Parsed.Mapper, edits)
 	if err != nil {
 		return nil, err
 	}
@@ -538,9 +534,9 @@ func goModTidy(ctx context.Context, snapshot source.Snapshot) (*protocol.CodeAct
 		Edit: protocol.WorkspaceEdit{
 			DocumentChanges: []protocol.TextDocumentEdit{{
 				TextDocument: protocol.VersionedTextDocumentIdentifier{
-					Version: mth.ParseModHandle().Mod().Version(),
+					Version: modFH.Version(),
 					TextDocumentIdentifier: protocol.TextDocumentIdentifier{
-						URI: protocol.URIFromSpanURI(uri),
+						URI: protocol.URIFromSpanURI(modFH.URI()),
 					},
 				},
 				Edits: protocolEdits,

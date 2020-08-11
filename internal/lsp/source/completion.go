@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/internal/event"
@@ -260,7 +261,7 @@ func (c *completer) setSurrounding(ident *ast.Ident) {
 		content: ident.Name,
 		cursor:  c.pos,
 		// Overwrite the prefix only.
-		mappedRange: newMappedRange(c.snapshot.View().Session().Cache().FileSet(), c.mapper, ident.Pos(), ident.End()),
+		mappedRange: newMappedRange(c.snapshot.FileSet(), c.mapper, ident.Pos(), ident.End()),
 	}
 
 	switch c.opts.matcher {
@@ -278,7 +279,7 @@ func (c *completer) getSurrounding() *Selection {
 		c.surrounding = &Selection{
 			content:     "",
 			cursor:      c.pos,
-			mappedRange: newMappedRange(c.snapshot.View().Session().Cache().FileSet(), c.mapper, c.pos, c.pos),
+			mappedRange: newMappedRange(c.snapshot.FileSet(), c.mapper, c.pos, c.pos),
 		}
 	}
 	return c.surrounding
@@ -329,6 +330,17 @@ func (c *completer) found(ctx context.Context, cand candidate) {
 
 	if c.matchingCandidate(&cand) {
 		cand.score *= highScore
+
+		if c.seenInSwitchCase(&cand) {
+			// If this candidate matches an expression already used in a
+			// different case clause, downrank. We only downrank a little
+			// because the user could write something like:
+			//
+			//   switch foo {
+			//   case bar:
+			//   case ba<>: // they may want "bar|baz" or "bar.baz()"
+			cand.score *= 0.9
+		}
 	} else if isTypeName(obj) {
 		// If obj is a *types.TypeName that didn't otherwise match, check
 		// if a literal object of this type makes a good candidate.
@@ -339,9 +351,11 @@ func (c *completer) found(ctx context.Context, cand candidate) {
 		}
 	}
 
-	// Lower score of function calls so we prefer fields and vars over calls.
+	// Lower score of method calls so we prefer fields and vars over calls.
 	if cand.expandFuncCall {
-		cand.score *= 0.9
+		if sig, ok := obj.Type().Underlying().(*types.Signature); ok && sig.Recv() != nil {
+			cand.score *= 0.9
+		}
 	}
 
 	// Prefer private objects over public ones.
@@ -371,6 +385,18 @@ func (c *completer) found(ctx context.Context, cand candidate) {
 	}
 
 	c.deepSearch(ctx, cand)
+}
+
+// seenInSwitchCase reports whether cand has already been seen in
+// another switch case statement.
+func (c *completer) seenInSwitchCase(cand *candidate) bool {
+	for _, chain := range c.inference.seenSwitchCases {
+		if c.objChainMatches(cand.obj, chain) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // candidate represents a completion candidate.
@@ -652,7 +678,7 @@ func (c *completer) containingIdent(src []byte) *ast.Ident {
 
 // scanToken scans pgh's contents for the token containing pos.
 func (c *completer) scanToken(contents []byte) (token.Pos, token.Token, string) {
-	tok := c.snapshot.View().Session().Cache().FileSet().File(c.pos)
+	tok := c.snapshot.FileSet().File(c.pos)
 
 	var s scanner.Scanner
 	s.Init(tok, contents, nil, 0)
@@ -700,15 +726,13 @@ func (c *completer) emptySwitchStmt() bool {
 // populateCommentCompletions yields completions for exported
 // symbols immediately preceding comment.
 func (c *completer) populateCommentCompletions(ctx context.Context, comment *ast.CommentGroup) {
-
 	// Using the comment position find the line after
-	fset := c.snapshot.View().Session().Cache().FileSet()
-	file := fset.File(comment.Pos())
+	file := c.snapshot.FileSet().File(comment.End())
 	if file == nil {
 		return
 	}
 
-	line := file.Line(comment.Pos())
+	line := file.Line(comment.End())
 	if file.LineCount() < line+1 {
 		return
 	}
@@ -717,6 +741,9 @@ func (c *completer) populateCommentCompletions(ctx context.Context, comment *ast
 	if !nextLinePos.IsValid() {
 		return
 	}
+
+	// comment is valid, set surrounding as word boundaries around cursor
+	c.setSurroundingForComment(comment)
 
 	// Using the next line pos, grab and parse the exported symbol on that line
 	for _, n := range c.file.Decls {
@@ -771,6 +798,45 @@ func (c *completer) populateCommentCompletions(ctx context.Context, comment *ast
 	}
 }
 
+// sets word boundaries surrounding a cursor for a comment
+func (c *completer) setSurroundingForComment(comments *ast.CommentGroup) {
+	var cursorComment *ast.Comment
+	for _, comment := range comments.List {
+		if c.pos >= comment.Pos() && c.pos <= comment.End() {
+			cursorComment = comment
+			break
+		}
+	}
+	// if cursor isn't in the comment
+	if cursorComment == nil {
+		return
+	}
+
+	// index of cursor in comment text
+	cursorOffset := int(c.pos - cursorComment.Pos())
+	start, end := cursorOffset, cursorOffset
+	for start > 0 && isValidIdentifierChar(cursorComment.Text[start-1]) {
+		start--
+	}
+	for end < len(cursorComment.Text) && isValidIdentifierChar(cursorComment.Text[end]) {
+		end++
+	}
+
+	c.surrounding = &Selection{
+		content: cursorComment.Text[start:end],
+		cursor:  c.pos,
+		mappedRange: newMappedRange(c.snapshot.FileSet(), c.mapper,
+			token.Pos(int(cursorComment.Slash)+start), token.Pos(int(cursorComment.Slash)+end)),
+	}
+}
+
+// isValidIdentifierChar returns true if a byte is a valid go identifier character
+// i.e unicode letter or digit or undescore
+func isValidIdentifierChar(char byte) bool {
+	charRune := rune(char)
+	return unicode.In(charRune, unicode.Letter, unicode.Digit) || char == '_'
+}
+
 func (c *completer) wantStructFieldCompletions() bool {
 	clInfo := c.enclosingCompositeLiteral
 	if clInfo == nil {
@@ -792,6 +858,8 @@ const (
 
 // selector finds completions for the specified selector expression.
 func (c *completer) selector(ctx context.Context, sel *ast.SelectorExpr) error {
+	c.inference.objChain = objChain(c.pkg.GetTypesInfo(), sel.X)
+
 	// Is sel a qualified identifier?
 	if id, ok := sel.X.(*ast.Ident); ok {
 		if pkgName, ok := c.pkg.GetTypesInfo().Uses[id].(*types.PkgName); ok {
@@ -988,8 +1056,7 @@ func (c *completer) lexical(ctx context.Context) error {
 					node = c.path[i-1]
 				}
 				if node != nil {
-					fset := c.snapshot.View().Session().Cache().FileSet()
-					if resolved := resolveInvalid(fset, obj, node, c.pkg.GetTypesInfo()); resolved != nil {
+					if resolved := resolveInvalid(c.snapshot.FileSet(), obj, node, c.pkg.GetTypesInfo()); resolved != nil {
 						obj = resolved
 					}
 				}
@@ -1066,11 +1133,6 @@ func (c *completer) lexical(ctx context.Context) error {
 	}
 
 	if t := c.inference.objType; t != nil {
-		// Use variadic element type if we are completing variadic position.
-		if c.inference.variadicType != nil {
-			t = c.inference.variadicType
-		}
-
 		t = deref(t)
 
 		// If we have an expected type and it is _not_ a named type, see
@@ -1474,6 +1536,7 @@ const (
 	kindMap
 	kindStruct
 	kindString
+	kindFunc
 )
 
 // candidateInference holds information we have inferred about a type that can be
@@ -1485,10 +1548,11 @@ type candidateInference struct {
 	// objKind is a mask of expected kinds of types such as "map", "slice", etc.
 	objKind objKind
 
-	// variadicType is the scalar variadic element type. For example,
-	// when completing "append([]T{}, <>)" objType is []T and
-	// variadicType is T.
-	variadicType types.Type
+	// variadic is true if we are completing the initial variadic
+	// parameter. For example:
+	//   append([]T{}, <>)      // objType=T variadic=true
+	//   append([]T{}, T{}, <>) // objType=T variadic=false
+	variadic bool
 
 	// modifiers are prefixes such as "*", "&" or "<-" that influence how
 	// a candidate type relates to the expected type.
@@ -1520,6 +1584,19 @@ type candidateInference struct {
 	// foo(bar<>)      // variadicAssignees=true
 	// foo(bar, baz<>) // variadicAssignees=false
 	variadicAssignees bool
+
+	// seenSwitchCases tracks the expressions already used in the
+	// containing switch statement's cases. Each expression is tracked
+	// as a slice of objects. For example, "case foo.bar().baz:" is
+	// tracked as []types.Object{foo, bar, baz}. Tracking the entire
+	// "chain" allows us to differentiate "a.foo" and "b.foo" when "a"
+	// and "b" are the same type.
+	seenSwitchCases [][]types.Object
+
+	// objChain contains the chain of objects representing the
+	// surrounding *ast.SelectorExpr. For example, if we are completing
+	// "foo.bar.ba<>", objChain will contain []types.Object{foo, bar}.
+	objChain []types.Object
 }
 
 // typeNameInference holds information about the expected type name at
@@ -1537,6 +1614,10 @@ type typeNameInference struct {
 
 	// wantComparable is true if we want a comparable type.
 	wantComparable bool
+
+	// seenTypeSwitchCases tracks types that have already been used by
+	// the containing type switch.
+	seenTypeSwitchCases []types.Type
 }
 
 // expectedCandidate returns information about the expected candidate
@@ -1558,7 +1639,14 @@ Nodes:
 				e = node.Y
 			}
 			if tv, ok := c.pkg.GetTypesInfo().Types[e]; ok {
-				inf.objType = tv.Type
+				switch node.Op {
+				case token.LAND, token.LOR:
+					// Don't infer "bool" type for "&&" or "||". Often you want
+					// to compose a boolean expression from non-boolean
+					// candidates.
+				default:
+					inf.objType = tv.Type
+				}
 				break Nodes
 			}
 		case *ast.AssignStmt:
@@ -1594,7 +1682,7 @@ Nodes:
 			return inf
 		case *ast.CallExpr:
 			// Only consider CallExpr args if position falls between parens.
-			if node.Lparen <= c.pos && c.pos <= node.Rparen {
+			if node.Lparen < c.pos && c.pos <= node.Rparen {
 				// For type conversions like "int64(foo)" we can only infer our
 				// desired type is convertible to int64.
 				if typ := typeConversion(node, c.pkg.GetTypesInfo()); typ != nil {
@@ -1609,18 +1697,14 @@ Nodes:
 							return inf
 						}
 
-						var (
-							exprIdx         = exprAtPos(c.pos, node.Args)
-							isLastParam     = exprIdx == numParams-1
-							beyondLastParam = exprIdx >= numParams
-						)
+						exprIdx := exprAtPos(c.pos, node.Args)
 
 						// If we have one or zero arg expressions, we may be
 						// completing to a function call that returns multiple
 						// values, in turn getting passed in to the surrounding
 						// call. Record the assignees so we can favor function
 						// calls that return matching values.
-						if len(node.Args) <= 1 {
+						if len(node.Args) <= 1 && exprIdx == 0 {
 							for i := 0; i < sig.Params().Len(); i++ {
 								inf.assignees = append(inf.assignees, sig.Params().At(i).Type())
 							}
@@ -1629,30 +1713,18 @@ Nodes:
 							inf.variadicAssignees = sig.Variadic()
 						}
 
-						if sig.Variadic() {
-							variadicType := deslice(sig.Params().At(numParams - 1).Type())
-
-							// If we are beyond the last param or we are the last
-							// param w/ further expressions, we expect a single
-							// variadic item.
-							if beyondLastParam || isLastParam && len(node.Args) > numParams {
-								inf.objType = variadicType
-								break Nodes
-							}
-
-							// Otherwise if we are at the last param then we are
-							// completing the variadic positition (i.e. we expect a
-							// slice type []T or an individual item T).
-							if isLastParam {
-								inf.variadicType = variadicType
-							}
-						}
-
 						// Make sure not to run past the end of expected parameters.
-						if beyondLastParam {
+						if exprIdx >= numParams {
 							inf.objType = sig.Params().At(numParams - 1).Type()
 						} else {
 							inf.objType = sig.Params().At(exprIdx).Type()
+						}
+
+						if sig.Variadic() && exprIdx >= (numParams-1) {
+							// If we are completing a variadic param, deslice the variadic type.
+							inf.objType = deslice(inf.objType)
+							// Record whether we are completing the initial variadic param.
+							inf.variadic = exprIdx == numParams-1 && len(node.Args) <= numParams
 						}
 					}
 				}
@@ -1680,8 +1752,9 @@ Nodes:
 						continue Nodes
 					}
 				}
+
+				return inf
 			}
-			return inf
 		case *ast.ReturnStmt:
 			if c.enclosingFunc != nil {
 				sig := c.enclosingFunc.sig
@@ -1697,6 +1770,21 @@ Nodes:
 			if swtch, ok := findSwitchStmt(c.path[i+1:], c.pos, node).(*ast.SwitchStmt); ok {
 				if tv, ok := c.pkg.GetTypesInfo().Types[swtch.Tag]; ok {
 					inf.objType = tv.Type
+
+					// Record which objects have already been used in the case
+					// statements so we don't suggest them again.
+					for _, cc := range swtch.Body.List {
+						for _, caseExpr := range cc.(*ast.CaseClause).List {
+							// Don't record the expression we are currently completing.
+							if caseExpr.Pos() < c.pos && c.pos <= caseExpr.End() {
+								continue
+							}
+
+							if objs := objChain(c.pkg.GetTypesInfo(), caseExpr); len(objs) > 0 {
+								inf.seenSwitchCases = append(inf.seenSwitchCases, objs)
+							}
+						}
+					}
 				}
 			}
 			return inf
@@ -1746,6 +1834,9 @@ Nodes:
 			case token.ARROW:
 				inf.modifiers = append(inf.modifiers, typeModifier{mod: chanRead})
 			}
+		case *ast.DeferStmt, *ast.GoStmt:
+			inf.objKind |= kindFunc
+			return inf
 		default:
 			if breaksExpectedTypeInference(node) {
 				return inf
@@ -1754,6 +1845,46 @@ Nodes:
 	}
 
 	return inf
+}
+
+// objChain decomposes e into a chain of objects if possible. For
+// example, "foo.bar().baz" will yield []types.Object{foo, bar, baz}.
+// If any part can't be turned into an object, return nil.
+func objChain(info *types.Info, e ast.Expr) []types.Object {
+	var objs []types.Object
+
+	for e != nil {
+		switch n := e.(type) {
+		case *ast.Ident:
+			obj := info.ObjectOf(n)
+			if obj == nil {
+				return nil
+			}
+			objs = append(objs, obj)
+			e = nil
+		case *ast.SelectorExpr:
+			obj := info.ObjectOf(n.Sel)
+			if obj == nil {
+				return nil
+			}
+			objs = append(objs, obj)
+			e = n.X
+		case *ast.CallExpr:
+			if len(n.Args) > 0 {
+				return nil
+			}
+			e = n.Fun
+		default:
+			return nil
+		}
+	}
+
+	// Reverse order so the layout matches the syntactic order.
+	for i := 0; i < len(objs)/2; i++ {
+		objs[i], objs[len(objs)-1-i] = objs[len(objs)-1-i], objs[i]
+	}
+
+	return objs
 }
 
 // applyTypeModifiers applies the list of type modifiers to a type.
@@ -1809,7 +1940,7 @@ func (ci candidateInference) applyTypeNameModifiers(typ types.Type) types.Type {
 // matchesVariadic returns true if we are completing a variadic
 // parameter and candType is a compatible slice type.
 func (ci candidateInference) matchesVariadic(candType types.Type) bool {
-	return ci.variadicType != nil && types.AssignableTo(candType, ci.objType)
+	return ci.variadic && ci.objType != nil && types.AssignableTo(candType, types.NewSlice(ci.objType))
 }
 
 // findSwitchStmt returns an *ast.CaseClause's corresponding *ast.SwitchStmt or
@@ -1851,10 +1982,11 @@ func breaksExpectedTypeInference(n ast.Node) bool {
 // expectTypeName returns information about the expected type name at position.
 func expectTypeName(c *completer) typeNameInference {
 	var (
-		wantTypeName   bool
-		wantComparable bool
-		modifiers      []typeModifier
-		assertableFrom types.Type
+		wantTypeName        bool
+		wantComparable      bool
+		modifiers           []typeModifier
+		assertableFrom      types.Type
+		seenTypeSwitchCases []types.Type
 	)
 
 Nodes:
@@ -1880,6 +2012,23 @@ Nodes:
 					return true
 				})
 				wantTypeName = true
+
+				// Track the types that have already been used in this
+				// switch's case statements so we don't recommend them.
+				for _, e := range swtch.Body.List {
+					for _, typeExpr := range e.(*ast.CaseClause).List {
+						// Skip if type expression contains pos. We don't want to
+						// count it as already used if the user is completing it.
+						if typeExpr.Pos() < c.pos && c.pos <= typeExpr.End() {
+							continue
+						}
+
+						if t := c.pkg.GetTypesInfo().TypeOf(typeExpr); t != nil {
+							seenTypeSwitchCases = append(seenTypeSwitchCases, t)
+						}
+					}
+				}
+
 				break Nodes
 			}
 			return typeNameInference{}
@@ -1951,10 +2100,11 @@ Nodes:
 	}
 
 	return typeNameInference{
-		wantTypeName:   wantTypeName,
-		wantComparable: wantComparable,
-		modifiers:      modifiers,
-		assertableFrom: assertableFrom,
+		wantTypeName:        wantTypeName,
+		wantComparable:      wantComparable,
+		modifiers:           modifiers,
+		assertableFrom:      assertableFrom,
+		seenTypeSwitchCases: seenTypeSwitchCases,
 	}
 }
 
@@ -2036,6 +2186,7 @@ func (c *candidate) anyCandType(f func(t types.Type, addressable bool) bool) boo
 }
 
 // matchingCandidate reports whether cand matches our type inferences.
+// It mutates cand's score in certain cases.
 func (c *completer) matchingCandidate(cand *candidate) bool {
 	if isTypeName(cand.obj) {
 		return c.matchingTypeName(cand)
@@ -2069,6 +2220,40 @@ func (c *completer) matchingCandidate(cand *candidate) bool {
 	return false
 }
 
+// objChainMatches reports whether cand combined with the surrounding
+// object prefix matches chain.
+func (c *completer) objChainMatches(cand types.Object, chain []types.Object) bool {
+	// For example, when completing:
+	//
+	//   foo.ba<>
+	//
+	// If we are considering the deep candidate "bar.baz", cand is baz,
+	// objChain is [foo] and deepChain is [bar]. We would match the
+	// chain [foo, bar, baz].
+
+	if len(chain) != len(c.inference.objChain)+len(c.deepState.chain)+1 {
+		return false
+	}
+
+	if chain[len(chain)-1] != cand {
+		return false
+	}
+
+	for i, o := range c.inference.objChain {
+		if chain[i] != o {
+			return false
+		}
+	}
+
+	for i, o := range c.deepState.chain {
+		if chain[i+len(c.inference.objChain)] != o {
+			return false
+		}
+	}
+
+	return true
+}
+
 // candTypeMatches reports whether cand makes a good completion
 // candidate given the candidate inference. cand's score may be
 // mutated to downrank the candidate in certain situations.
@@ -2076,9 +2261,9 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 	expTypes := make([]types.Type, 0, 2)
 	if ci.objType != nil {
 		expTypes = append(expTypes, ci.objType)
-	}
-	if ci.variadicType != nil {
-		expTypes = append(expTypes, ci.variadicType)
+		if ci.variadic {
+			expTypes = append(expTypes, types.NewSlice(ci.objType))
+		}
 	}
 
 	return cand.anyCandType(func(candType types.Type, addressable bool) bool {
@@ -2108,7 +2293,12 @@ func (ci *candidateInference) candTypeMatches(cand *candidate) bool {
 
 			// If we have no expected type, fall back to checking the
 			// expected "kind" of object, if available.
-			return ci.kindMatches(candType)
+			if ci.kindMatches(candType) {
+				if ci.objKind == kindFunc {
+					cand.expandFuncCall = true
+				}
+				return true
+			}
 		}
 
 		for _, expType := range expTypes {
@@ -2250,6 +2440,14 @@ func (c *completer) matchingTypeName(cand *candidate) bool {
 			return false
 		}
 
+		// Skip this type if it has already been used in another type
+		// switch case.
+		for _, seen := range c.inference.typeName.seenTypeSwitchCases {
+			if types.Identical(candType, seen) {
+				return false
+			}
+		}
+
 		// We can expect a type name and have an expected type in cases like:
 		//
 		//   var foo []int
@@ -2264,11 +2462,13 @@ func (c *completer) matchingTypeName(cand *candidate) bool {
 		return true
 	}
 
-	if typeMatches(cand.obj.Type()) {
+	t := cand.obj.Type()
+
+	if typeMatches(t) {
 		return true
 	}
 
-	if typeMatches(types.NewPointer(cand.obj.Type())) {
+	if !isInterface(t) && typeMatches(types.NewPointer(t)) {
 		cand.makePointer = true
 		return true
 	}
@@ -2297,6 +2497,8 @@ func candKind(candType types.Type) objKind {
 		if t.Info()&types.IsString > 0 {
 			return kindString
 		}
+	case *types.Signature:
+		return kindFunc
 	}
 
 	return 0

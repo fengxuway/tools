@@ -111,8 +111,8 @@ var (
 		Name:           "extract_variable",
 		Title:          "Extract to variable",
 		suggestedFixFn: extractVariable,
-		appliesFn: func(fset *token.FileSet, rng span.Range, src []byte, file *ast.File, pkg *types.Package, info *types.Info) bool {
-			_, _, ok, _ := canExtractVariable(fset, rng, src, file, pkg, info)
+		appliesFn: func(_ *token.FileSet, rng span.Range, _ []byte, file *ast.File, _ *types.Package, _ *types.Info) bool {
+			_, _, ok, _ := canExtractVariable(rng, file)
 			return ok
 		},
 	}
@@ -122,7 +122,10 @@ var (
 		Name:           "extract_function",
 		Title:          "Extract to function",
 		suggestedFixFn: extractFunction,
-		appliesFn:      canExtractFunction,
+		appliesFn: func(fset *token.FileSet, rng span.Range, src []byte, file *ast.File, _ *types.Package, info *types.Info) bool {
+			_, _, _, _, _, ok, _ := canExtractFunction(fset, rng, src, file, info)
+			return ok
+		},
 	}
 )
 
@@ -149,7 +152,7 @@ func (c *Command) IsSuggestedFix() bool {
 
 // SuggestedFix applies the command's suggested fix to the given file and
 // range, returning the resulting edits.
-func (c *Command) SuggestedFix(ctx context.Context, snapshot Snapshot, fh FileHandle, pRng protocol.Range) ([]protocol.TextDocumentEdit, error) {
+func (c *Command) SuggestedFix(ctx context.Context, snapshot Snapshot, fh VersionedFileHandle, pRng protocol.Range) ([]protocol.TextDocumentEdit, error) {
 	if c.suggestedFixFn == nil {
 		return nil, fmt.Errorf("no suggested fix function for %s", c.Name)
 	}
@@ -209,6 +212,5 @@ func getAllSuggestedFixInputs(ctx context.Context, snapshot Snapshot, fh FileHan
 	if err != nil {
 		return nil, span.Range{}, nil, nil, nil, nil, nil, err
 	}
-	fset := snapshot.View().Session().Cache().FileSet()
-	return fset, rng, src, pgf.File, pgf.Mapper, pkg.GetTypes(), pkg.GetTypesInfo(), nil
+	return snapshot.FileSet(), rng, src, pgf.File, pgf.Mapper, pkg.GetTypes(), pkg.GetTypesInfo(), nil
 }

@@ -25,7 +25,7 @@ import (
 // idWithAnalysis is used to track if the diagnostics for a given file were
 // computed with analyses.
 type idWithAnalysis struct {
-	id           source.FileIdentity
+	id           source.VersionedFileIdentity
 	withAnalysis bool
 }
 
@@ -117,32 +117,24 @@ If you believe this is a mistake, please file an issue: https://github.com/golan
 		go func(pkg source.Package) {
 			defer wg.Done()
 
-			detailsDir := ""
-			// Only run analyses for packages with open files.
-			withAnalysis := alwaysAnalyze
+			withAnalysis := alwaysAnalyze // only run analyses for packages with open files
+			var gcDetailsDir span.URI     // find the package's optimization details, if available
 			for _, pgf := range pkg.CompiledGoFiles() {
 				if snapshot.IsOpen(pgf.URI) {
 					withAnalysis = true
 				}
-				if detailsDir == "" {
-					dir := filepath.Dir(pgf.URI.Filename())
-					if s.gcOptimizatonDetails[span.URI(dir)] {
-						detailsDir = dir
+				if gcDetailsDir == "" {
+					dirURI := span.URIFromPath(filepath.Dir(pgf.URI.Filename()))
+					s.gcOptimizationDetailsMu.Lock()
+					_, ok := s.gcOptimizatonDetails[dirURI]
+					s.gcOptimizationDetailsMu.Unlock()
+					if ok {
+						gcDetailsDir = dirURI
 					}
 				}
 			}
 
 			pkgReports, warn, err := source.Diagnostics(ctx, snapshot, pkg, withAnalysis)
-			if detailsDir != "" {
-				var more map[source.FileIdentity][]*source.Diagnostic
-				more, err = source.DoGcDetails(ctx, snapshot, detailsDir)
-				if err != nil {
-					event.Error(ctx, "warning: gcdetails", err, tag.Snapshot.Of(snapshot.ID()))
-				}
-				for k, v := range more {
-					pkgReports[k] = append(pkgReports[k], v...)
-				}
-			}
 
 			// Check if might want to warn the user about their build configuration.
 			// Our caller decides whether to send the message.
@@ -169,6 +161,26 @@ If you believe this is a mistake, please file an issue: https://github.com/golan
 				}
 				for _, d := range diags {
 					reports[key][diagnosticKey(d)] = d
+				}
+			}
+			// If gc optimization details are available, add them to the
+			// diagnostic reports.
+			if gcDetailsDir != "" {
+				gcReports, err := source.GCOptimizationDetails(ctx, snapshot, gcDetailsDir)
+				if err != nil {
+					event.Error(ctx, "warning: gc details", err, tag.Snapshot.Of(snapshot.ID()))
+				}
+				for id, diags := range gcReports {
+					key := idWithAnalysis{
+						id:           id,
+						withAnalysis: withAnalysis,
+					}
+					if _, ok := reports[key]; !ok {
+						reports[key] = map[string]*source.Diagnostic{}
+					}
+					for _, d := range diags {
+						reports[key][diagnosticKey(d)] = d
+					}
 				}
 			}
 			reportsMu.Unlock()
@@ -214,8 +226,7 @@ func (s *Server) publishReports(ctx context.Context, snapshot source.Snapshot, r
 		}
 		source.SortDiagnostics(diagnostics)
 		toSend := sentDiagnostics{
-			version:      key.id.Version,
-			identifier:   key.id.Identifier,
+			id:           key.id,
 			sorted:       diagnostics,
 			withAnalysis: key.withAnalysis,
 			snapshotID:   snapshot.ID(),
@@ -243,7 +254,7 @@ func (s *Server) publishReports(ctx context.Context, snapshot source.Snapshot, r
 
 		// If we've already delivered diagnostics for this file, at this
 		// snapshot, with analyses, do not send diagnostics without analyses.
-		if delivered.snapshotID == toSend.snapshotID && delivered.version == toSend.version &&
+		if delivered.snapshotID == toSend.snapshotID && delivered.id == toSend.id &&
 			delivered.withAnalysis && !toSend.withAnalysis {
 			// Do not update the delivered map since it already contains better diagnostics.
 			continue
@@ -354,7 +365,7 @@ See https://github.com/golang/go/issues/39164 for more detail on this issue.`,
 			return false
 		}
 		s.publishReports(ctx, snapshot, map[idWithAnalysis]map[string]*source.Diagnostic{
-			{id: fh.Identity()}: {diagnosticKey(diag): diag},
+			{id: fh.VersionedFileIdentity()}: {diagnosticKey(diag): diag},
 		})
 		return true
 	}
