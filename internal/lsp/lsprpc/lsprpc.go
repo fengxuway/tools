@@ -25,6 +25,7 @@ import (
 	"golang.org/x/tools/internal/lsp/debug"
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
+	errors "golang.org/x/xerrors"
 )
 
 // AutoNetwork is the pseudo network type used to signal that gopls should use
@@ -77,7 +78,7 @@ func (s *StreamServer) ServeStream(ctx context.Context, conn jsonrpc2.Conn) erro
 	ctx = protocol.WithClient(ctx, client)
 	conn.Go(ctx,
 		protocol.Handlers(
-			handshaker(session, executable,
+			handshaker(session, executable, s.logConnections,
 				protocol.ServerHandler(server,
 					jsonrpc2.MethodNotFound))))
 	if s.logConnections {
@@ -100,62 +101,70 @@ type Forwarder struct {
 	// goplsPath is the path to the current executing gopls binary.
 	goplsPath string
 
-	// configuration
-	dialTimeout         time.Duration
-	retries             int
-	remoteDebug         string
-	remoteListenTimeout time.Duration
-	remoteLogfile       string
+	// configuration for the auto-started gopls remote.
+	remoteConfig remoteConfig
 }
 
-// A ForwarderOption configures the behavior of the LSP forwarder.
-type ForwarderOption interface {
-	setForwarder(*Forwarder)
+type remoteConfig struct {
+	debug         string
+	listenTimeout time.Duration
+	logfile       string
+}
+
+// A RemoteOption configures the behavior of the auto-started remote.
+type RemoteOption interface {
+	set(*remoteConfig)
 }
 
 // RemoteDebugAddress configures the address used by the auto-started Gopls daemon
 // for serving debug information.
 type RemoteDebugAddress string
 
-func (d RemoteDebugAddress) setForwarder(fwd *Forwarder) {
-	fwd.remoteDebug = string(d)
+func (d RemoteDebugAddress) set(cfg *remoteConfig) {
+	cfg.debug = string(d)
 }
 
 // RemoteListenTimeout configures the amount of time the auto-started gopls
 // daemon will wait with no client connections before shutting down.
 type RemoteListenTimeout time.Duration
 
-func (d RemoteListenTimeout) setForwarder(fwd *Forwarder) {
-	fwd.remoteListenTimeout = time.Duration(d)
+func (d RemoteListenTimeout) set(cfg *remoteConfig) {
+	cfg.listenTimeout = time.Duration(d)
 }
 
 // RemoteLogfile configures the logfile location for the auto-started gopls
 // daemon.
 type RemoteLogfile string
 
-func (l RemoteLogfile) setForwarder(fwd *Forwarder) {
-	fwd.remoteLogfile = string(l)
+func (l RemoteLogfile) set(cfg *remoteConfig) {
+	cfg.logfile = string(l)
+}
+
+func defaultRemoteConfig() remoteConfig {
+	return remoteConfig{
+		listenTimeout: 1 * time.Minute,
+	}
 }
 
 // NewForwarder creates a new Forwarder, ready to forward connections to the
 // remote server specified by network and addr.
-func NewForwarder(network, addr string, opts ...ForwarderOption) *Forwarder {
+func NewForwarder(network, addr string, opts ...RemoteOption) *Forwarder {
 	gp, err := os.Executable()
 	if err != nil {
 		log.Printf("error getting gopls path for forwarder: %v", err)
 		gp = ""
 	}
 
-	fwd := &Forwarder{
-		network:             network,
-		addr:                addr,
-		goplsPath:           gp,
-		dialTimeout:         1 * time.Second,
-		retries:             5,
-		remoteListenTimeout: 1 * time.Minute,
-	}
+	rcfg := defaultRemoteConfig()
 	for _, opt := range opts {
-		opt.setForwarder(fwd)
+		opt.set(&rcfg)
+	}
+
+	fwd := &Forwarder{
+		network:      network,
+		addr:         addr,
+		goplsPath:    gp,
+		remoteConfig: rcfg,
 	}
 	return fwd
 }
@@ -165,19 +174,19 @@ func QueryServerState(ctx context.Context, network, address string) (*ServerStat
 	if network == AutoNetwork {
 		gp, err := os.Executable()
 		if err != nil {
-			return nil, fmt.Errorf("getting gopls path: %w", err)
+			return nil, errors.Errorf("getting gopls path: %w", err)
 		}
 		network, address = autoNetworkAddress(gp, address)
 	}
 	netConn, err := net.DialTimeout(network, address, 5*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("dialing remote: %w", err)
+		return nil, errors.Errorf("dialing remote: %w", err)
 	}
 	serverConn := jsonrpc2.NewConn(jsonrpc2.NewHeaderStream(netConn))
 	serverConn.Go(ctx, jsonrpc2.MethodNotFound)
 	var state ServerState
 	if err := protocol.Call(ctx, serverConn, sessionsMethod, nil, &state); err != nil {
-		return nil, fmt.Errorf("querying server state: %w", err)
+		return nil, errors.Errorf("querying server state: %w", err)
 	}
 	return &state, nil
 }
@@ -189,7 +198,7 @@ func (f *Forwarder) ServeStream(ctx context.Context, clientConn jsonrpc2.Conn) e
 
 	netConn, err := f.connectToRemote(ctx)
 	if err != nil {
-		return fmt.Errorf("forwarder: connecting to remote: %w", err)
+		return errors.Errorf("forwarder: connecting to remote: %w", err)
 	}
 	serverConn := jsonrpc2.NewConn(jsonrpc2.NewHeaderStream(netConn))
 	server := protocol.ServerDispatcher(serverConn)
@@ -242,25 +251,46 @@ func (f *Forwarder) ServeStream(ctx context.Context, clientConn jsonrpc2.Conn) e
 		serverConn.Close()
 	}
 
-	err = serverConn.Err()
-	if err == nil {
-		err = clientConn.Err()
+	err = nil
+	if serverConn.Err() != nil {
+		err = errors.Errorf("remote disconnected: %v", err)
+	} else if clientConn.Err() != nil {
+		err = errors.Errorf("client disconnected: %v", err)
 	}
+	event.Log(ctx, fmt.Sprintf("forwarder: exited with error: %v", err))
 	return err
 }
 
 func (f *Forwarder) connectToRemote(ctx context.Context) (net.Conn, error) {
+	return connectToRemote(ctx, f.network, f.addr, f.goplsPath, f.remoteConfig)
+}
+
+func ConnectToRemote(ctx context.Context, network, addr string, opts ...RemoteOption) (net.Conn, error) {
+	rcfg := defaultRemoteConfig()
+	for _, opt := range opts {
+		opt.set(&rcfg)
+	}
+	// This is not strictly necessary, as it won't be used if not connecting to
+	// the 'auto' remote.
+	goplsPath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("unable to resolve gopls path: %v", err)
+	}
+	return connectToRemote(ctx, network, addr, goplsPath, rcfg)
+}
+
+func connectToRemote(ctx context.Context, inNetwork, inAddr, goplsPath string, rcfg remoteConfig) (net.Conn, error) {
 	var (
 		netConn          net.Conn
 		err              error
-		network, address = f.network, f.addr
+		network, address = inNetwork, inAddr
 	)
-	if f.network == AutoNetwork {
+	if inNetwork == AutoNetwork {
 		// f.network is overloaded to support a concept of 'automatic' addresses,
 		// which signals that the gopls remote address should be automatically
 		// derived.
 		// So we need to resolve a real network and address here.
-		network, address = autoNetworkAddress(f.goplsPath, f.addr)
+		network, address = autoNetworkAddress(goplsPath, inAddr)
 	}
 	// Attempt to verify that we own the remote. This is imperfect, but if we can
 	// determine that the remote is owned by a different user, we should fail.
@@ -274,14 +304,15 @@ func (f *Forwarder) connectToRemote(ctx context.Context) (net.Conn, error) {
 		// closed.
 		return nil, fmt.Errorf("socket %q is owned by a different user", address)
 	}
+	const dialTimeout = 1 * time.Second
 	// Try dialing our remote once, in case it is already running.
-	netConn, err = net.DialTimeout(network, address, f.dialTimeout)
+	netConn, err = net.DialTimeout(network, address, dialTimeout)
 	if err == nil {
 		return netConn, nil
 	}
 	// If our remote is on the 'auto' network, start it if it doesn't exist.
-	if f.network == AutoNetwork {
-		if f.goplsPath == "" {
+	if inNetwork == AutoNetwork {
+		if goplsPath == "" {
 			return nil, fmt.Errorf("cannot auto-start remote: gopls path is unknown")
 		}
 		if network == "unix" {
@@ -293,41 +324,42 @@ func (f *Forwarder) connectToRemote(ctx context.Context) (net.Conn, error) {
 			// instances are simultaneously starting up.
 			if _, err := os.Stat(address); err == nil {
 				if err := os.Remove(address); err != nil {
-					return nil, fmt.Errorf("removing remote socket file: %w", err)
+					return nil, errors.Errorf("removing remote socket file: %w", err)
 				}
 			}
 		}
 		args := []string{"serve",
 			"-listen", fmt.Sprintf(`%s;%s`, network, address),
-			"-listen.timeout", f.remoteListenTimeout.String(),
+			"-listen.timeout", rcfg.listenTimeout.String(),
 		}
-		if f.remoteLogfile != "" {
-			args = append(args, "-logfile", f.remoteLogfile)
+		if rcfg.logfile != "" {
+			args = append(args, "-logfile", rcfg.logfile)
 		}
-		if f.remoteDebug != "" {
-			args = append(args, "-debug", f.remoteDebug)
+		if rcfg.debug != "" {
+			args = append(args, "-debug", rcfg.debug)
 		}
-		if err := startRemote(f.goplsPath, args...); err != nil {
-			return nil, fmt.Errorf("startRemote(%q, %v): %w", f.goplsPath, args, err)
+		if err := startRemote(goplsPath, args...); err != nil {
+			return nil, errors.Errorf("startRemote(%q, %v): %w", goplsPath, args, err)
 		}
 	}
 
+	const retries = 5
 	// It can take some time for the newly started server to bind to our address,
 	// so we retry for a bit.
-	for retry := 0; retry < f.retries; retry++ {
+	for retry := 0; retry < retries; retry++ {
 		startDial := time.Now()
-		netConn, err = net.DialTimeout(network, address, f.dialTimeout)
+		netConn, err = net.DialTimeout(network, address, dialTimeout)
 		if err == nil {
 			return netConn, nil
 		}
 		event.Log(ctx, fmt.Sprintf("failed attempt #%d to connect to remote: %v\n", retry+2, err))
 		// In case our failure was a fast-failure, ensure we wait at least
 		// f.dialTimeout before trying again.
-		if retry != f.retries-1 {
-			time.Sleep(f.dialTimeout - time.Since(startDial))
+		if retry != retries-1 {
+			time.Sleep(dialTimeout - time.Since(startDial))
 		}
 	}
-	return nil, fmt.Errorf("dialing remote: %w", err)
+	return nil, errors.Errorf("dialing remote: %w", err)
 }
 
 // forwarderHandler intercepts 'exit' messages to prevent the shared gopls
@@ -469,7 +501,7 @@ const (
 	sessionsMethod  = "gopls/sessions"
 )
 
-func handshaker(session *cache.Session, goplsPath string, handler jsonrpc2.Handler) jsonrpc2.Handler {
+func handshaker(session *cache.Session, goplsPath string, logHandshakes bool, handler jsonrpc2.Handler) jsonrpc2.Handler {
 	return func(ctx context.Context, reply jsonrpc2.Replier, r jsonrpc2.Request) error {
 		switch r.Method() {
 		case handshakeMethod:
@@ -478,11 +510,15 @@ func handshaker(session *cache.Session, goplsPath string, handler jsonrpc2.Handl
 			// client.
 			var req handshakeRequest
 			if err := json.Unmarshal(r.Params(), &req); err != nil {
-				log.Printf("Error processing handshake for session %s: %v", session.ID(), err)
+				if logHandshakes {
+					log.Printf("Error processing handshake for session %s: %v", session.ID(), err)
+				}
 				sendError(ctx, reply, err)
 				return nil
 			}
-			log.Printf("Session %s: got handshake. Logfile: %q, Debug addr: %q", session.ID(), req.Logfile, req.DebugAddr)
+			if logHandshakes {
+				log.Printf("Session %s: got handshake. Logfile: %q, Debug addr: %q", session.ID(), req.Logfile, req.DebugAddr)
+			}
 			event.Log(ctx, "Handshake session update",
 				cache.KeyUpdateSession.Of(session),
 				tag.DebugAddress.Of(req.DebugAddr),
@@ -523,7 +559,7 @@ func handshaker(session *cache.Session, goplsPath string, handler jsonrpc2.Handl
 }
 
 func sendError(ctx context.Context, reply jsonrpc2.Replier, err error) {
-	err = fmt.Errorf("%w: %v", jsonrpc2.ErrParse, err)
+	err = errors.Errorf("%v: %w", err, jsonrpc2.ErrParse)
 	if err := reply(ctx, nil, err); err != nil {
 		event.Error(ctx, "", err)
 	}

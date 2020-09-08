@@ -126,10 +126,10 @@ type View struct {
 	// Only possible with Go versions 1.14 and above.
 	tmpMod bool
 
-	// noGopackagesDriver is true if the user has no value set for the
-	// GOPACKAGESDRIVER environment variable and no gopackagesdriver binary on
+	// hasGopackagesDriver is true if the user has a value set for the
+	// GOPACKAGESDRIVER environment variable or a gopackagesdriver binary on
 	// their machine.
-	noGopackagesDriver bool
+	hasGopackagesDriver bool
 
 	// `go env` variables that need to be tracked by gopls.
 	gocache, gomodcache, gopath, goprivate string
@@ -472,35 +472,6 @@ func basename(filename string) string {
 	return strings.ToLower(filepath.Base(filename))
 }
 
-func (v *View) WorkspaceDirectories(ctx context.Context) ([]string, error) {
-	// If the view does not have a go.mod file, only the root directory
-	// is known. In GOPATH mode, we should really watch the entire GOPATH,
-	// but that's probably too expensive.
-	// TODO(rstambler): Figure out a better approach in the future.
-	if v.modURI == "" {
-		return []string{v.root.Filename()}, nil
-	}
-	// Anything inside of the module root is known.
-	dirs := []string{filepath.Dir(v.modURI.Filename())}
-
-	// Keep track of any directories mentioned in replace targets.
-	fh, err := v.session.GetFile(ctx, v.modURI)
-	if err != nil {
-		return nil, err
-	}
-	snapshot, release := v.Snapshot(ctx)
-	defer release()
-
-	pm, err := snapshot.ParseMod(ctx, fh)
-	if err != nil {
-		return nil, err
-	}
-	for _, replace := range pm.File.Replace {
-		dirs = append(dirs, replace.New.Path)
-	}
-	return dirs, nil
-}
-
 func (v *View) relevantChange(c source.FileModification) bool {
 	// If the file is known to the view, the change is relevant.
 	known := v.knownFile(c.URI)
@@ -683,7 +654,8 @@ func (v *View) initialize(ctx context.Context, s *snapshot, firstAttempt bool) {
 	})
 }
 
-func (v *View) awaitInitialized(ctx context.Context) {
+// AwaitInitialized waits until a view is initialized
+func (v *View) AwaitInitialized(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
@@ -706,7 +678,7 @@ func (v *View) invalidateContent(ctx context.Context, uris map[span.URI]source.V
 	v.cancelBackground()
 
 	// Do not clone a snapshot until its view has finished initializing.
-	v.awaitInitialized(ctx)
+	v.AwaitInitialized(ctx)
 
 	// This should be the only time we hold the view's snapshot lock for any period of time.
 	v.snapshotMu.Lock()
@@ -745,7 +717,7 @@ func (v *View) maybeReinitialize() {
 
 func (v *View) setBuildInformation(ctx context.Context, folder span.URI, options source.Options) error {
 	if err := checkPathCase(folder.Filename()); err != nil {
-		return fmt.Errorf("invalid workspace configuration: %w", err)
+		return errors.Errorf("invalid workspace configuration: %w", err)
 	}
 	// Make sure to get the `go env` before continuing with initialization.
 	modFile, err := v.setGoEnv(ctx, options.Env)
@@ -762,7 +734,6 @@ func (v *View) setBuildInformation(ctx context.Context, folder span.URI, options
 		v.sumURI = span.URIFromPath(sumFilename)
 	}
 
-	v.root = v.folder
 	if options.ExpandWorkspaceToModule && v.modURI != "" {
 		v.root = span.URIFromPath(filepath.Dir(v.modURI.Filename()))
 	}
@@ -796,7 +767,7 @@ func (v *View) setBuildConfiguration() (isValid bool) {
 	}()
 	// Since we only really understand the `go` command, if the user has a
 	// different GOPACKAGESDRIVER, assume that their configuration is valid.
-	if !v.noGopackagesDriver {
+	if v.hasGopackagesDriver {
 		return true
 	}
 	// Check if the user is working within a module.
@@ -871,7 +842,7 @@ func (v *View) setGoEnv(ctx context.Context, configEnv []string) (string, error)
 	// A user may also have a gopackagesdriver binary on their machine, which
 	// works the same way as setting GOPACKAGESDRIVER.
 	tool, _ := exec.LookPath("gopackagesdriver")
-	v.noGopackagesDriver = gopackagesdriver == "off" || (gopackagesdriver == "" && tool == "")
+	v.hasGopackagesDriver = gopackagesdriver != "off" && (gopackagesdriver != "" || tool != "")
 	return gomod, nil
 }
 

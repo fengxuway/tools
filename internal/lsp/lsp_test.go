@@ -18,7 +18,6 @@ import (
 	"golang.org/x/tools/internal/lsp/cache"
 	"golang.org/x/tools/internal/lsp/diff"
 	"golang.org/x/tools/internal/lsp/diff/myers"
-	"golang.org/x/tools/internal/lsp/mod"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/tests"
@@ -121,7 +120,7 @@ func (r *runner) CallHierarchy(t *testing.T, spn span.Span, expectedCalls *tests
 		t.Fatal(err)
 	}
 	if len(items) == 0 {
-		t.Errorf("expected call hierarchy item to be returned for identifier at %v\n", loc.Range)
+		t.Fatalf("expected call hierarchy item to be returned for identifier at %v\n", loc.Range)
 	}
 
 	callLocation := protocol.Location{
@@ -129,17 +128,33 @@ func (r *runner) CallHierarchy(t *testing.T, spn span.Span, expectedCalls *tests
 		Range: items[0].Range,
 	}
 	if callLocation != loc {
-		t.Errorf("expected server.PrepareCallHierarchy to return identifier at %v but got %v\n", loc, callLocation)
+		t.Fatalf("expected server.PrepareCallHierarchy to return identifier at %v but got %v\n", loc, callLocation)
 	}
 
-	// TODO: add span comparison tests for expectedCalls once call hierarchy is implemented
 	incomingCalls, err := r.server.IncomingCalls(r.ctx, &protocol.CallHierarchyIncomingCallsParams{Item: items[0]})
-	if len(incomingCalls) != 0 {
-		t.Errorf("expected no incoming calls but got %d", len(incomingCalls))
+	if err != nil {
+		t.Error(err)
 	}
+	var incomingCallItems []protocol.CallHierarchyItem
+	for _, item := range incomingCalls {
+		incomingCallItems = append(incomingCallItems, item.From)
+	}
+	msg := tests.DiffCallHierarchyItems(incomingCallItems, expectedCalls.IncomingCalls)
+	if msg != "" {
+		t.Error(fmt.Sprintf("incoming calls: %s", msg))
+	}
+
 	outgoingCalls, err := r.server.OutgoingCalls(r.ctx, &protocol.CallHierarchyOutgoingCallsParams{Item: items[0]})
-	if len(outgoingCalls) != 0 {
-		t.Errorf("expected no outgoing calls but got %d", len(outgoingCalls))
+	if err != nil {
+		t.Error(err)
+	}
+	var outgoingCallItems []protocol.CallHierarchyItem
+	for _, item := range outgoingCalls {
+		outgoingCallItems = append(outgoingCallItems, item.To)
+	}
+	msg = tests.DiffCallHierarchyItems(outgoingCallItems, expectedCalls.OutgoingCalls)
+	if msg != "" {
+		t.Error(fmt.Sprintf("outgoing calls: %s", msg))
 	}
 }
 
@@ -147,18 +162,16 @@ func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens) 
 	if source.DetectLanguage("", uri.Filename()) != source.Mod {
 		return
 	}
-	v, err := r.server.session.ViewOf(uri)
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapshot, release := v.Snapshot(r.ctx)
-	defer release()
-	got, err := mod.CodeLens(r.ctx, snapshot, uri)
+	got, err := r.server.codeLens(r.ctx, &protocol.CodeLensParams{
+		TextDocument: protocol.TextDocumentIdentifier{
+			URI: protocol.DocumentURI(uri),
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if diff := tests.DiffCodeLens(uri, want, got); diff != "" {
-		t.Error(diff)
+		t.Errorf("%s: %s", uri, diff)
 	}
 }
 

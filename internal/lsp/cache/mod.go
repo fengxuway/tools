@@ -6,7 +6,9 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -48,10 +50,9 @@ func (mh *parseModHandle) parse(ctx context.Context, snapshot *snapshot) (*sourc
 }
 
 func (s *snapshot) ParseMod(ctx context.Context, modFH source.FileHandle) (*source.ParsedModule, error) {
-	if handle := s.getModHandle(modFH.URI()); handle != nil {
+	if handle := s.getParseModHandle(modFH.URI()); handle != nil {
 		return handle.parse(ctx, s)
 	}
-
 	h := s.generation.Bind(modFH.FileIdentity(), func(ctx context.Context, _ memoize.Arg) interface{} {
 		_, done := event.Start(ctx, "cache.ParseModHandle", tag.URI.Of(modFH.URI()))
 		defer done()
@@ -72,10 +73,15 @@ func (s *snapshot) ParseMod(ctx context.Context, modFH source.FileHandle) (*sour
 		}
 		data.parsed.File, data.err = modfile.Parse(modFH.URI().Filename(), contents, nil)
 		if data.err != nil {
-			// Attempt to convert the error to a non-fatal parse error.
+			// Attempt to convert the error to a standardized parse error.
 			if parseErr, extractErr := extractModParseErrors(modFH.URI(), m, data.err, contents); extractErr == nil {
-				data.err = nil
 				data.parsed.ParseErrors = []source.Error{*parseErr}
+			}
+			// If the file was still parsed, we don't want to treat this as a
+			// fatal error. Note: This currently cannot happen as modfile.Parse
+			// always returns an error when the file is nil.
+			if data.parsed.File != nil {
+				data.err = nil
 			}
 		}
 		return data
@@ -189,17 +195,18 @@ func (mwh *modWhyHandle) why(ctx context.Context, snapshot *snapshot) (map[strin
 	return data.why, data.err
 }
 
-func (s *snapshot) ModWhy(ctx context.Context) (map[string]string, error) {
+func (s *snapshot) ModWhy(ctx context.Context, fh source.FileHandle) (map[string]string, error) {
 	if err := s.awaitLoaded(ctx); err != nil {
 		return nil, err
 	}
-	fh, err := s.GetFile(ctx, s.view.modURI)
-	if err != nil {
-		return nil, err
+	if handle := s.getModWhyHandle(fh.URI()); handle != nil {
+		return handle.why(ctx, s)
 	}
+	// Make sure to use the module root as the working directory.
+	cfg := s.configWithDir(ctx, filepath.Dir(fh.URI().Filename()))
 	key := modKey{
 		sessionID: s.view.session.id,
-		cfg:       hashConfig(s.config(ctx)),
+		cfg:       hashConfig(cfg),
 		mod:       fh.FileIdentity(),
 		view:      s.view.root.Filename(),
 		verb:      why,
@@ -242,10 +249,10 @@ func (s *snapshot) ModWhy(ctx context.Context) (map[string]string, error) {
 
 	mwh := &modWhyHandle{handle: h}
 	s.mu.Lock()
-	s.modWhyHandle = mwh
+	s.modWhyHandles[fh.URI()] = mwh
 	s.mu.Unlock()
 
-	return s.modWhyHandle.why(ctx, s)
+	return mwh.why(ctx, s)
 }
 
 type modUpgradeHandle struct {
@@ -259,7 +266,7 @@ type modUpgradeData struct {
 	err error
 }
 
-func (muh *modUpgradeHandle) Upgrades(ctx context.Context, snapshot *snapshot) (map[string]string, error) {
+func (muh *modUpgradeHandle) upgrades(ctx context.Context, snapshot *snapshot) (map[string]string, error) {
 	v, err := muh.handle.Get(ctx, snapshot.generation, snapshot)
 	if v == nil {
 		return nil, err
@@ -268,15 +275,24 @@ func (muh *modUpgradeHandle) Upgrades(ctx context.Context, snapshot *snapshot) (
 	return data.upgrades, data.err
 }
 
-func (s *snapshot) ModUpgrade(ctx context.Context) (map[string]string, error) {
+// moduleUpgrade describes a module that can be upgraded to a particular
+// version.
+type moduleUpgrade struct {
+	Path   string
+	Update struct {
+		Version string
+	}
+}
+
+func (s *snapshot) ModUpgrade(ctx context.Context, fh source.FileHandle) (map[string]string, error) {
 	if err := s.awaitLoaded(ctx); err != nil {
 		return nil, err
 	}
-	fh, err := s.GetFile(ctx, s.view.modURI)
-	if err != nil {
-		return nil, err
+	if handle := s.getModUpgradeHandle(fh.URI()); handle != nil {
+		return handle.upgrades(ctx, s)
 	}
-	cfg := s.config(ctx)
+	// Use the module root as the working directory.
+	cfg := s.configWithDir(ctx, filepath.Dir(fh.URI().Filename()))
 	key := modKey{
 		sessionID: s.view.session.id,
 		cfg:       hashConfig(cfg),
@@ -290,7 +306,7 @@ func (s *snapshot) ModUpgrade(ctx context.Context) (map[string]string, error) {
 
 		snapshot := arg.(*snapshot)
 
-		pm, err := s.ParseMod(ctx, fh)
+		pm, err := snapshot.ParseMod(ctx, fh)
 		if err != nil {
 			return &modUpgradeData{err: err}
 		}
@@ -301,7 +317,7 @@ func (s *snapshot) ModUpgrade(ctx context.Context) (map[string]string, error) {
 		}
 		// Run "go list -mod readonly -u -m all" to be able to see which deps can be
 		// upgraded without modifying mod file.
-		args := []string{"-u", "-m", "all"}
+		args := []string{"-u", "-m", "-json", "all"}
 		if !snapshot.view.tmpMod || containsVendor(fh.URI()) {
 			// Use -mod=readonly if the module contains a vendor directory
 			// (see golang/go#38711).
@@ -311,28 +327,26 @@ func (s *snapshot) ModUpgrade(ctx context.Context) (map[string]string, error) {
 		if err != nil {
 			return &modUpgradeData{err: err}
 		}
-		upgradesList := strings.Split(stdout.String(), "\n")
-		if len(upgradesList) <= 1 {
-			return nil
+		var upgradeList []moduleUpgrade
+		dec := json.NewDecoder(stdout)
+		for {
+			var m moduleUpgrade
+			if err := dec.Decode(&m); err == io.EOF {
+				break
+			} else if err != nil {
+				return &modUpgradeData{err: err}
+			}
+			upgradeList = append(upgradeList, m)
+		}
+		if len(upgradeList) <= 1 {
+			return &modUpgradeData{}
 		}
 		upgrades := make(map[string]string)
-		for _, upgrade := range upgradesList[1:] {
-			// Example: "github.com/x/tools v1.1.0 [v1.2.0]"
-			info := strings.Split(upgrade, " ")
-			if len(info) != 3 {
+		for _, upgrade := range upgradeList[1:] {
+			if upgrade.Update.Version == "" {
 				continue
 			}
-			dep, version := info[0], info[2]
-
-			// Make sure that the format matches our expectation.
-			if len(version) < 2 {
-				continue
-			}
-			if version[0] != '[' || version[len(version)-1] != ']' {
-				continue
-			}
-			latest := version[1 : len(version)-1] // remove the "[" and "]"
-			upgrades[dep] = latest
+			upgrades[upgrade.Path] = upgrade.Update.Version
 		}
 		return &modUpgradeData{
 			upgrades: upgrades,
@@ -340,10 +354,10 @@ func (s *snapshot) ModUpgrade(ctx context.Context) (map[string]string, error) {
 	})
 	muh := &modUpgradeHandle{handle: h}
 	s.mu.Lock()
-	s.modUpgradeHandle = muh
+	s.modUpgradeHandles[fh.URI()] = muh
 	s.mu.Unlock()
 
-	return s.modUpgradeHandle.Upgrades(ctx, s)
+	return muh.upgrades(ctx, s)
 }
 
 // containsVendor reports whether the module has a vendor folder.

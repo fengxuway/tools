@@ -141,11 +141,7 @@ func (s *snapshot) buildKey(ctx context.Context, id packageID, mode source.Parse
 	// Begin computing the key by getting the depKeys for all dependencies.
 	var depKeys []packageHandleKey
 	for _, depID := range depList {
-		mode := source.ParseExported
-		if _, ok := s.isWorkspacePackage(depID); ok {
-			mode = source.ParseFull
-		}
-		depHandle, err := s.buildPackageHandle(ctx, depID, mode)
+		depHandle, err := s.buildPackageHandle(ctx, depID, s.workspaceParseMode(depID))
 		if err != nil {
 			event.Error(ctx, "no dep handle", err, tag.Package.Of(string(depID)))
 			if ctx.Err() != nil {
@@ -161,6 +157,14 @@ func (s *snapshot) buildKey(ctx context.Context, id packageID, mode source.Parse
 	}
 	ph.key = checkPackageKey(ctx, ph.m.id, compiledGoFiles, m.config, depKeys, mode)
 	return ph, deps, nil
+}
+
+func (s *snapshot) workspaceParseMode(id packageID) source.ParseMode {
+	if _, ws := s.isWorkspacePackage(id); ws {
+		return source.ParseFull
+	} else {
+		return source.ParseExported
+	}
 }
 
 func checkPackageKey(ctx context.Context, id packageID, pghs []*parseGoHandle, cfg *packages.Config, deps []packageHandleKey, mode source.ParseMode) packageHandleKey {
@@ -401,6 +405,7 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 
 	// We don't care about a package's errors unless we have parsed it in full.
 	if mode == source.ParseFull {
+		expandErrors(rawErrors)
 		for _, e := range rawErrors {
 			srcErr, err := sourceError(ctx, snapshot, pkg, e)
 			if err != nil {
@@ -408,13 +413,55 @@ func typeCheck(ctx context.Context, snapshot *snapshot, m *metadata, mode source
 				continue
 			}
 			pkg.errors = append(pkg.errors, srcErr)
-			if err, ok := e.(types.Error); ok {
-				pkg.typeErrors = append(pkg.typeErrors, err)
+			if err, ok := e.(extendedError); ok {
+				pkg.typeErrors = append(pkg.typeErrors, err.primary)
 			}
 		}
 	}
 
 	return pkg, nil
+}
+
+type extendedError struct {
+	primary     types.Error
+	secondaries []types.Error
+}
+
+func (e extendedError) Error() string {
+	return e.primary.Error()
+}
+
+// expandErrors duplicates "secondary" errors by mapping them to their main
+// error. Some errors returned by the type checker are followed by secondary
+// errors which give more information about the error. These are errors in
+// their own right, and they are marked by starting with \t. For instance, when
+// there is a multiply-defined function, the secondary error points back to the
+// definition first noticed.
+//
+// This code associates the secondary error with its primary error, which can
+// then be used as RelatedInformation when the error becomes a diagnostic.
+func expandErrors(errs []error) []error {
+	for i := 0; i < len(errs); {
+		e, ok := errs[i].(types.Error)
+		if !ok {
+			i++
+			continue
+		}
+		enew := extendedError{
+			primary: e,
+		}
+		j := i + 1
+		for ; j < len(errs); j++ {
+			spl, ok := errs[j].(types.Error)
+			if !ok || len(spl.Msg) == 0 || spl.Msg[0] != '\t' {
+				break
+			}
+			enew.secondaries = append(enew.secondaries, spl)
+		}
+		errs[i] = enew
+		i = j
+	}
+	return errs
 }
 
 // resolveImportPath resolves an import path in pkg to a package from deps.

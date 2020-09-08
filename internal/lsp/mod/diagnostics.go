@@ -8,6 +8,7 @@ package mod
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"unicode"
@@ -34,7 +35,7 @@ func Diagnostics(ctx context.Context, snapshot source.Snapshot) (map[source.Vers
 	if err != nil {
 		return nil, err
 	}
-	tidied, err := snapshot.ModTidy(ctx)
+	tidied, err := snapshot.ModTidy(ctx, fh)
 	if err == source.ErrTmpModfileUnsupported {
 		return nil, nil
 	}
@@ -130,7 +131,10 @@ func ExtractGoCommandError(ctx context.Context, snapshot source.Snapshot, fh sou
 		return toDiagnostic(rep.Syntax)
 	}
 	// No match for the module path was found in the go.mod file.
-	// Show the error on the module declaration.
+	// Show the error on the module declaration, if one exists.
+	if pm.File.Module == nil {
+		return nil, fmt.Errorf("no module declaration in %s", fh.URI())
+	}
 	return toDiagnostic(pm.File.Module.Syntax)
 }
 

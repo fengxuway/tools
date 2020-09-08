@@ -13,6 +13,7 @@ import (
 	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
+	"golang.org/x/tools/internal/span"
 )
 
 func (s *Server) completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
@@ -25,7 +26,7 @@ func (s *Server) completion(ctx context.Context, params *protocol.CompletionPara
 	var surrounding *source.Selection
 	switch fh.Kind() {
 	case source.Go:
-		candidates, surrounding, err = source.Completion(ctx, snapshot, fh, params.Position)
+		candidates, surrounding, err = source.Completion(ctx, snapshot, fh, params.Position, params.Context.TriggerCharacter)
 	case source.Mod:
 		candidates, surrounding = nil, nil
 	}
@@ -41,6 +42,52 @@ func (s *Server) completion(ctx context.Context, params *protocol.CompletionPara
 	rng, err := surrounding.Range()
 	if err != nil {
 		return nil, err
+	}
+
+	// internal/span treats end of file as the beginning of the next line, even
+	// when it's not newline-terminated. We correct for that behaviour here if
+	// end of file is not newline-terminated. See golang/go#41029.
+	src, err := fh.Read()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the actual number of lines in source.
+	numLines := len(strings.Split(string(src), "\n"))
+
+	tok := snapshot.FileSet().File(surrounding.Start())
+	endOfFile := tok.Pos(tok.Size())
+
+	// For newline-terminated files, the line count reported by go/token should
+	// be lower than the actual number of lines we see when splitting by \n. If
+	// they're the same, the file isn't newline-terminated.
+	if numLines == tok.LineCount() && tok.Size() != 0 {
+		// Get span for character before end of file to bypass span's treatment of end
+		// of file. We correct for this later.
+		spn, err := span.NewRange(snapshot.FileSet(), endOfFile-1, endOfFile-1).Span()
+		if err != nil {
+			return nil, err
+		}
+		m := &protocol.ColumnMapper{
+			URI:       fh.URI(),
+			Converter: span.NewContentConverter(fh.URI().Filename(), []byte(src)),
+			Content:   []byte(src),
+		}
+		eofRng, err := m.Range(spn)
+		if err != nil {
+			return nil, err
+		}
+		eofPosition := protocol.Position{
+			Line: eofRng.Start.Line,
+			// Correct for using endOfFile - 1 earlier.
+			Character: eofRng.Start.Character + 1,
+		}
+		if surrounding.Start() == endOfFile {
+			rng.Start = eofPosition
+		}
+		if surrounding.End() == endOfFile {
+			rng.End = eofPosition
+		}
 	}
 
 	// When using deep completions/fuzzy matching, report results as incomplete so

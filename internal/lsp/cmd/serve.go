@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"golang.org/x/tools/internal/lsp/lsprpc"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/tool"
+	errors "golang.org/x/xerrors"
 )
 
 // Serve is a struct that exposes the configurable parts of the LSP server as
@@ -105,7 +107,11 @@ func (s *Serve) Run(ctx context.Context, args ...string) error {
 		stream = protocol.LoggingStream(stream, di.LogWriter)
 	}
 	conn := jsonrpc2.NewConn(stream)
-	return ss.ServeStream(ctx, conn)
+	err := ss.ServeStream(ctx, conn)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	return err
 }
 
 // parseAddr parses the -listen flag in to a network, and address.

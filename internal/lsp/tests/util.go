@@ -227,11 +227,11 @@ func DiffCodeLens(uri span.URI, want, got []protocol.CodeLens) string {
 	}
 	for i, w := range want {
 		g := got[i]
+		if w.Command.Command != g.Command.Command {
+			return summarizeCodeLens(i, uri, want, got, "incorrect Command Name got %v want %v", g.Command.Command, w.Command.Command)
+		}
 		if w.Command.Title != g.Command.Title {
 			return summarizeCodeLens(i, uri, want, got, "incorrect Command Title got %v want %v", g.Command.Title, w.Command.Title)
-		}
-		if w.Command.Command != g.Command.Command {
-			return summarizeCodeLens(i, uri, want, got, "incorrect Command Title got %v want %v", g.Command.Command, w.Command.Command)
 		}
 		if protocol.ComparePosition(w.Range.Start, g.Range.Start) != 0 {
 			return summarizeCodeLens(i, uri, want, got, "incorrect Start got %v want %v", g.Range.Start, w.Range.Start)
@@ -252,11 +252,11 @@ func sortCodeLens(c []protocol.CodeLens) {
 		}
 		if c[i].Command.Command < c[j].Command.Command {
 			return true
+		} else if c[i].Command.Command == c[j].Command.Command {
+			return c[i].Command.Title < c[j].Command.Title
+		} else {
+			return false
 		}
-		if c[i].Command.Command == c[j].Command.Command {
-			return true
-		}
-		return c[i].Command.Title <= c[j].Command.Title
 	})
 }
 
@@ -306,6 +306,28 @@ func DiffSignatures(spn span.Span, want, got *protocol.SignatureHelp) string {
 	paramsStr := strings.Join(paramParts, ", ")
 	if !strings.Contains(g.Label, paramsStr) {
 		return decorate("expected signature %q to contain params %q", g.Label, paramsStr)
+	}
+	return ""
+}
+
+// DiffCallHierarchyItems returns the diff between expected and actual call locations for incoming/outgoing call hierarchies
+func DiffCallHierarchyItems(gotCalls []protocol.CallHierarchyItem, expectedCalls []protocol.CallHierarchyItem) string {
+	expected := make(map[protocol.Location]bool)
+	for _, call := range expectedCalls {
+		expected[protocol.Location{URI: call.URI, Range: call.Range}] = true
+	}
+
+	got := make(map[protocol.Location]bool)
+	for _, call := range gotCalls {
+		got[protocol.Location{URI: call.URI, Range: call.Range}] = true
+	}
+	if len(got) != len(expected) {
+		return fmt.Sprintf("expected %d calls but got %d", len(expected), len(got))
+	}
+	for spn := range got {
+		if !expected[spn] {
+			return fmt.Sprintf("incorrect calls, expected locations %v but got locations %v", expected, got)
+		}
 	}
 	return ""
 }

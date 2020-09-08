@@ -115,7 +115,7 @@ func (r *runner) CallHierarchy(t *testing.T, spn span.Span, expectedCalls *tests
 		t.Fatal(err)
 	}
 	if len(items) == 0 {
-		t.Errorf("expected call hierarchy item to be returned for identifier at %v\n", loc.Range)
+		t.Fatalf("expected call hierarchy item to be returned for identifier at %v\n", loc.Range)
 	}
 
 	callLocation := protocol.Location{
@@ -123,17 +123,33 @@ func (r *runner) CallHierarchy(t *testing.T, spn span.Span, expectedCalls *tests
 		Range: items[0].Range,
 	}
 	if callLocation != loc {
-		t.Errorf("expected source.PrepareCallHierarchy to return identifier at %v but got %v\n", loc, callLocation)
+		t.Fatalf("expected source.PrepareCallHierarchy to return identifier at %v but got %v\n", loc, callLocation)
 	}
 
-	// TODO: add span comparison tests for expectedCalls once call hierarchy is implemented
 	incomingCalls, err := source.IncomingCalls(r.ctx, r.snapshot, fh, loc.Range.Start)
-	if len(incomingCalls) != 0 {
-		t.Errorf("expected no incoming calls but got %d", len(incomingCalls))
+	if err != nil {
+		t.Error(err)
 	}
+	var incomingCallItems []protocol.CallHierarchyItem
+	for _, item := range incomingCalls {
+		incomingCallItems = append(incomingCallItems, item.From)
+	}
+	msg := tests.DiffCallHierarchyItems(incomingCallItems, expectedCalls.IncomingCalls)
+	if msg != "" {
+		t.Error(fmt.Sprintf("incoming calls differ: %s", msg))
+	}
+
 	outgoingCalls, err := source.OutgoingCalls(r.ctx, r.snapshot, fh, loc.Range.Start)
-	if len(outgoingCalls) != 0 {
-		t.Errorf("expected no outgoing calls but got %d", len(outgoingCalls))
+	if err != nil {
+		t.Error(err)
+	}
+	var outgoingCallItems []protocol.CallHierarchyItem
+	for _, item := range outgoingCalls {
+		outgoingCallItems = append(outgoingCallItems, item.To)
+	}
+	msg = tests.DiffCallHierarchyItems(outgoingCallItems, expectedCalls.OutgoingCalls)
+	if msg != "" {
+		t.Error(fmt.Sprintf("outgoing calls differ: %s", msg))
 	}
 }
 
@@ -291,7 +307,7 @@ func (r *runner) callCompletion(t *testing.T, src span.Span, options func(*sourc
 	list, surrounding, err := source.Completion(r.ctx, r.snapshot, fh, protocol.Position{
 		Line:      float64(src.Start().Line() - 1),
 		Character: float64(src.Start().Column() - 1),
-	})
+	}, "")
 	if err != nil && !errors.As(err, &source.ErrIsDefinition{}) {
 		t.Fatalf("failed for %v: %v", src, err)
 	}
@@ -908,20 +924,7 @@ func (r *runner) SignatureHelp(t *testing.T, spn span.Span, want *protocol.Signa
 func (r *runner) Link(t *testing.T, uri span.URI, wantLinks []tests.Link)         {}
 func (r *runner) SuggestedFix(t *testing.T, spn span.Span, actionKinds []string)  {}
 func (r *runner) FunctionExtraction(t *testing.T, start span.Span, end span.Span) {}
-
-func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens) {
-	fh, err := r.snapshot.GetFile(r.ctx, uri)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := source.CodeLens(r.ctx, r.snapshot, fh)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := tests.DiffCodeLens(uri, want, got); diff != "" {
-		t.Error(diff)
-	}
-}
+func (r *runner) CodeLens(t *testing.T, uri span.URI, want []protocol.CodeLens)   {}
 
 func spanToRange(data *tests.Data, spn span.Span) (*protocol.ColumnMapper, protocol.Range, error) {
 	m, err := data.Mapper(spn.URI())

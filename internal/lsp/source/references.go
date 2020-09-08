@@ -9,6 +9,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"sort"
 
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/lsp/protocol"
@@ -40,11 +41,25 @@ func References(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Posit
 	if err != nil {
 		return nil, err
 	}
-	return references(ctx, s, qualifiedObjs, includeDeclaration)
+	refs, err := references(ctx, s, qualifiedObjs, includeDeclaration)
+	if err != nil {
+		return nil, err
+	}
+	toSort := refs
+	if includeDeclaration {
+		toSort = refs[1:]
+	}
+	sort.Slice(toSort, func(i, j int) bool {
+		x := span.CompareURI(toSort[i].URI(), toSort[j].URI())
+		if x == 0 {
+			return toSort[i].ident.Pos() < toSort[j].ident.Pos()
+		}
+		return x < 0
+	})
+	return refs, nil
 }
 
-// references is a helper function used by both References and Rename,
-// to avoid recomputing qualifiedObjsAtProtocolPos.
+// references is a helper function to avoid recomputing qualifiedObjsAtProtocolPos.
 func references(ctx context.Context, snapshot Snapshot, qos []qualifiedObject, includeDeclaration bool) ([]*ReferenceInfo, error) {
 	var (
 		references []*ReferenceInfo

@@ -3,41 +3,39 @@ package mod
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"golang.org/x/mod/modfile"
-	"golang.org/x/tools/internal/event"
-	"golang.org/x/tools/internal/lsp/debug/tag"
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
 )
 
-// CodeLens computes code lens for a go.mod file.
-func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]protocol.CodeLens, error) {
-	if !snapshot.View().Options().EnabledCodeLens[source.CommandUpgradeDependency.Name] {
-		return nil, nil
+// LensFuncs returns the supported lensFuncs for go.mod files.
+func LensFuncs() map[string]source.LensFunc {
+	return map[string]source.LensFunc{
+		source.CommandUpgradeDependency.Name: upgradeLens,
+		source.CommandTidy.Name:              tidyLens,
+		source.CommandVendor.Name:            vendorLens,
 	}
-	ctx, done := event.Start(ctx, "mod.CodeLens", tag.URI.Of(uri))
-	defer done()
+}
 
-	// Only show go.mod code lenses in module mode, for the view's go.mod.
-	if modURI := snapshot.View().ModFile(); modURI == "" || modURI != uri {
-		return nil, nil
-	}
-	fh, err := snapshot.GetFile(ctx, uri)
-	if err != nil {
-		return nil, err
-	}
+func upgradeLens(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]protocol.CodeLens, error) {
 	pm, err := snapshot.ParseMod(ctx, fh)
 	if err != nil {
 		return nil, err
 	}
-	upgrades, err := snapshot.ModUpgrade(ctx)
+	module := pm.File.Module
+	if module == nil || module.Syntax == nil {
+		return nil, nil
+	}
+	upgrades, err := snapshot.ModUpgrade(ctx, fh)
 	if err != nil {
 		return nil, err
 	}
 	var (
-		codelens    []protocol.CodeLens
+		codelenses  []protocol.CodeLens
 		allUpgrades []string
 	)
 	for _, req := range pm.File.Require {
@@ -47,45 +45,106 @@ func CodeLens(ctx context.Context, snapshot source.Snapshot, uri span.URI) ([]pr
 			continue
 		}
 		// Get the range of the require directive.
-		rng, err := positionsToRange(uri, pm.Mapper, req.Syntax.Start, req.Syntax.End)
+		rng, err := positionsToRange(fh.URI(), pm.Mapper, req.Syntax.Start, req.Syntax.End)
 		if err != nil {
 			return nil, err
 		}
-		jsonArgs, err := source.MarshalArgs(uri, []string{dep})
+		upgradeDepArgs, err := source.MarshalArgs(fh.URI(), []string{dep})
 		if err != nil {
 			return nil, err
 		}
-		codelens = append(codelens, protocol.CodeLens{
+		codelenses = append(codelenses, protocol.CodeLens{
 			Range: rng,
 			Command: protocol.Command{
 				Title:     fmt.Sprintf("Upgrade dependency to %s", latest),
 				Command:   source.CommandUpgradeDependency.Name,
-				Arguments: jsonArgs,
+				Arguments: upgradeDepArgs,
 			},
 		})
 		allUpgrades = append(allUpgrades, dep)
 	}
-	// If there is at least 1 upgrade, add an "Upgrade all dependencies" to the module statement.
-	if module := pm.File.Module; len(allUpgrades) > 0 && module != nil && module.Syntax != nil {
+	// If there is at least 1 upgrade, add "Upgrade all dependencies" to
+	// the module statement.
+	if len(allUpgrades) > 0 {
+		upgradeDepArgs, err := source.MarshalArgs(fh.URI(), append([]string{"-u"}, allUpgrades...))
+		if err != nil {
+			return nil, err
+		}
 		// Get the range of the module directive.
-		rng, err := positionsToRange(uri, pm.Mapper, module.Syntax.Start, module.Syntax.End)
+		moduleRng, err := positionsToRange(pm.Mapper.URI, pm.Mapper, module.Syntax.Start, module.Syntax.End)
 		if err != nil {
 			return nil, err
 		}
-		jsonArgs, err := source.MarshalArgs(uri, append([]string{"-u"}, allUpgrades...))
-		if err != nil {
-			return nil, err
-		}
-		codelens = append(codelens, protocol.CodeLens{
-			Range: rng,
+		codelenses = append(codelenses, protocol.CodeLens{
+			Range: moduleRng,
 			Command: protocol.Command{
 				Title:     "Upgrade all dependencies",
 				Command:   source.CommandUpgradeDependency.Name,
-				Arguments: jsonArgs,
+				Arguments: upgradeDepArgs,
 			},
 		})
 	}
-	return codelens, err
+	return codelenses, err
+}
+
+func tidyLens(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]protocol.CodeLens, error) {
+	goModArgs, err := source.MarshalArgs(fh.URI())
+	if err != nil {
+		return nil, err
+	}
+	tidied, err := snapshot.ModTidy(ctx, fh)
+	if err != nil {
+		return nil, err
+	}
+	if len(tidied.Errors) == 0 {
+		return nil, nil
+	}
+	pm, err := snapshot.ParseMod(ctx, fh)
+	if err != nil {
+		return nil, err
+	}
+	rng, err := positionsToRange(pm.Mapper.URI, pm.Mapper, pm.File.Module.Syntax.Start, pm.File.Module.Syntax.End)
+	if err != nil {
+		return nil, err
+	}
+	return []protocol.CodeLens{{
+		Range: rng,
+		Command: protocol.Command{
+			Title:     "Tidy module",
+			Command:   source.CommandTidy.Name,
+			Arguments: goModArgs,
+		},
+	}}, err
+}
+
+func vendorLens(ctx context.Context, snapshot source.Snapshot, fh source.FileHandle) ([]protocol.CodeLens, error) {
+	goModArgs, err := source.MarshalArgs(fh.URI())
+	if err != nil {
+		return nil, err
+	}
+	pm, err := snapshot.ParseMod(ctx, fh)
+	if err != nil {
+		return nil, err
+	}
+	rng, err := positionsToRange(pm.Mapper.URI, pm.Mapper, pm.File.Module.Syntax.Start, pm.File.Module.Syntax.End)
+	if err != nil {
+		return nil, err
+	}
+	// Change the message depending on whether or not the module already has a
+	// vendor directory.
+	title := "Create vendor directory"
+	vendorDir := filepath.Join(filepath.Dir(fh.URI().Filename()), "vendor")
+	if info, _ := os.Stat(vendorDir); info != nil && info.IsDir() {
+		title = "Sync vendor directory"
+	}
+	return []protocol.CodeLens{{
+		Range: rng,
+		Command: protocol.Command{
+			Title:     title,
+			Command:   source.CommandVendor.Name,
+			Arguments: goModArgs,
+		},
+	}}, nil
 }
 
 func positionsToRange(uri span.URI, m *protocol.ColumnMapper, s, e modfile.Position) (protocol.Range, error) {

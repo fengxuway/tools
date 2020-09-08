@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ import (
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
 	"golang.org/x/tools/internal/xcontext"
-	"golang.org/x/xerrors"
+	errors "golang.org/x/xerrors"
 )
 
 // idWithAnalysis is used to track if the diagnostics for a given file were
@@ -93,18 +94,24 @@ func (s *Server) diagnose(ctx context.Context, snapshot source.Snapshot, alwaysA
 	// Diagnose all of the packages in the workspace.
 	wsPkgs, err := snapshot.WorkspacePackages(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, nil
+		}
 		// Try constructing a more helpful error message out of this error.
 		if s.handleFatalErrors(ctx, snapshot, modErr, err) {
 			return nil, nil
 		}
-		msg := `The code in the workspace failed to compile (see the error message below).
-If you believe this is a mistake, please file an issue: https://github.com/golang/go/issues/new.`
-		event.Error(ctx, msg, err, tag.Snapshot.Of(snapshot.ID()), tag.Directory.Of(snapshot.View().Folder()))
-		if err := s.client.ShowMessage(ctx, &protocol.ShowMessageParams{
-			Type:    protocol.Error,
-			Message: fmt.Sprintf("%s\n%v", msg, err),
-		}); err != nil {
-			event.Error(ctx, "ShowMessage failed", err, tag.Directory.Of(snapshot.View().Folder().Filename()))
+		event.Error(ctx, "errors diagnosing workspace", err, tag.Snapshot.Of(snapshot.ID()), tag.Directory.Of(snapshot.View().Folder()))
+		// Present any `go list` errors directly to the user.
+		if errors.Is(err, source.PackagesLoadError) {
+			if err := s.client.ShowMessage(ctx, &protocol.ShowMessageParams{
+				Type: protocol.Error,
+				Message: fmt.Sprintf(`The code in the workspace failed to compile (see the error message below).
+If you believe this is a mistake, please file an issue: https://github.com/golang/go/issues/new.
+%v`, err),
+			}); err != nil {
+				event.Error(ctx, "ShowMessage failed", err, tag.Directory.Of(snapshot.View().Folder().Filename()))
+			}
 		}
 		return nil, nil
 	}
@@ -149,7 +156,7 @@ If you believe this is a mistake, please file an issue: https://github.com/golan
 				return
 			}
 
-			// Add all reports to the global map, checking for duplciates.
+			// Add all reports to the global map, checking for duplicates.
 			reportsMu.Lock()
 			for id, diags := range pkgReports {
 				key := idWithAnalysis{
@@ -300,7 +307,8 @@ func toProtocolDiagnostics(diagnostics []*source.Diagnostic) []protocol.Diagnost
 			})
 		}
 		reports = append(reports, protocol.Diagnostic{
-			Message:            strings.TrimSpace(diag.Message), // go list returns errors prefixed by newline
+			// diag.Message might start with \n or \t
+			Message:            strings.TrimSpace(diag.Message),
 			Range:              diag.Range,
 			Severity:           diag.Severity,
 			Source:             diag.Source,
@@ -314,7 +322,20 @@ func toProtocolDiagnostics(diagnostics []*source.Diagnostic) []protocol.Diagnost
 func (s *Server) handleFatalErrors(ctx context.Context, snapshot source.Snapshot, modErr, loadErr error) bool {
 	modURI := snapshot.View().ModFile()
 
-	// We currently only have workarounds for errors associated with modules.
+	// If the folder has no Go code in it, we shouldn't spam the user with a warning.
+	var hasGo bool
+	_ = filepath.Walk(snapshot.View().Folder().Filename(), func(path string, info os.FileInfo, err error) error {
+		if !strings.HasSuffix(info.Name(), ".go") {
+			return nil
+		}
+		hasGo = true
+		return errors.New("done")
+	})
+	if !hasGo {
+		return true
+	}
+
+	// All other workarounds are for errors associated with modules.
 	if modURI == "" {
 		return false
 	}
@@ -355,7 +376,7 @@ See https://github.com/golang/go/issues/39164 for more detail on this issue.`,
 	if modErr == nil {
 		return false
 	}
-	if xerrors.Is(loadErr, source.PackagesLoadError) {
+	if errors.Is(loadErr, source.PackagesLoadError) {
 		fh, err := snapshot.GetFile(ctx, modURI)
 		if err != nil {
 			return false

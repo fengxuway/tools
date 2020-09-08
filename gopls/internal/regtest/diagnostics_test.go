@@ -276,7 +276,7 @@ func Hello() {
 			env.Await(
 				env.DiagnosticAtRegexp("main.go", `"mod.com/bob"`),
 			)
-			if err := env.Sandbox.RunGoCommand(env.Ctx, "mod", "init", "mod.com"); err != nil {
+			if err := env.Sandbox.RunGoCommand(env.Ctx, "", "mod", []string{"init", "mod.com"}); err != nil {
 				t.Fatal(err)
 			}
 			env.Await(
@@ -541,12 +541,34 @@ func f() {
 				CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidOpen), 1),
 				NoDiagnostics("a.go"),
 			),
-			EmptyShowMessage(""),
+			NoShowMessage(),
 		)
 		// introduce an error, expect no Show Message
 		env.RegexpReplace("a.go", "func", "fun")
-		env.Await(env.DiagnosticAtRegexp("a.go", "fun"), EmptyShowMessage(""))
+		env.Await(env.DiagnosticAtRegexp("a.go", "fun"), NoShowMessage())
 	})
+}
+
+func TestNonGoFolder(t *testing.T) {
+	const files = `
+-- hello.txt --
+hi mom
+`
+	for _, go111module := range []string{"on", "off", ""} {
+		t.Run(fmt.Sprintf("GO111MODULE_%v", go111module), func(t *testing.T) {
+			withOptions(WithEditorConfig(fake.EditorConfig{
+				Env: map[string]string{"GO111MODULE": go111module},
+			})).run(t, files, func(t *testing.T, env *Env) {
+				env.OpenFile("hello.txt")
+				env.Await(
+					OnceMet(
+						CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidOpen), 1),
+						NoShowMessage(),
+					),
+				)
+			})
+		})
+	}
 }
 
 // Tests golang/go#38602.
@@ -813,6 +835,82 @@ func TestHello(t *testing.T) {
 	})
 }
 
+// Reproduce golang/go#40690.
+func TestCreateOnlyXTest(t *testing.T) {
+	t.Skip("golang/go#40690 is not resolved yet.")
+
+	const mod = `
+	-- go.mod --
+	module mod.com
+	-- foo/foo.go --
+	package foo
+	-- foo/bar_test.go --
+	`
+	run(t, mod, func(t *testing.T, env *Env) {
+		env.Await(CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromInitialWorkspaceLoad), 1))
+		env.OpenFile("foo/bar_test.go")
+		env.EditBuffer("foo/bar_test.go", fake.NewEdit(0, 0, 0, 0, `package foo
+	`))
+		env.Await(
+			CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChange), 1),
+		)
+		env.RegexpReplace("foo/bar_test.go", "package foo", "package foo_test")
+		env.Await(
+			OnceMet(
+				CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChange), 2),
+				NoErrorLogs(),
+			),
+		)
+	})
+}
+
+func TestChangePackageName(t *testing.T) {
+	t.Skip("This issue hasn't been fixed yet. See golang.org/issue/41061.")
+
+	const mod = `
+-- go.mod --
+module mod.com
+-- foo/foo.go --
+package foo
+-- foo/bar_test.go --
+package foo_
+`
+	run(t, mod, func(t *testing.T, env *Env) {
+		env.Await(CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromInitialWorkspaceLoad), 1))
+		env.OpenFile("foo/bar_test.go")
+		env.RegexpReplace("foo/bar_test.go", "package foo_", "package foo_test")
+		env.SaveBuffer("foo/bar_test.go")
+		env.Await(
+			OnceMet(
+				CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidSave), 1),
+				NoDiagnostics("foo/bar_test.go"),
+			),
+			OnceMet(
+				CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidSave), 1),
+				NoDiagnostics("foo/foo.go"),
+			),
+		)
+	})
+}
+
+// Reproduces golang/go#40825.
+func TestEmptyGOPATHXTest_40825(t *testing.T) {
+	const files = `
+-- x.go --
+package x
+-- x_test.go --
+`
+
+	withOptions(InGOPATH()).run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("x_test.go")
+		env.EditBuffer("x_test.go", fake.NewEdit(0, 0, 0, 0, "pack"))
+		env.Await(
+			CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromDidChange), 1),
+			NoShowMessage(),
+		)
+	})
+}
+
 func TestIgnoredFiles(t *testing.T) {
 	const ws = `
 -- go.mod --
@@ -928,21 +1026,21 @@ func main() {
 			writeGoVim(env, "p/p.go", p)
 			writeGoVim(env, "main.go", main)
 			writeGoVim(env, "p/p_test.go", `package p
-	
+
 import "testing"
-	
+
 func TestDoIt(t *testing.T) {
 	DoIt(5)
 }
 `)
 			writeGoVim(env, "p/x_test.go", `package p_test
-	
+
 import (
 	"testing"
 
 	"mod.com/p"
 )
-	
+
 func TestDoIt(t *testing.T) {
 	p.DoIt(5)
 }
@@ -1146,5 +1244,72 @@ func main() {
 		env.Await(
 			NoDiagnostics("main.go"),
 		)
+	})
+}
+
+func TestStaticcheckDiagnostic(t *testing.T) {
+	const files = `
+-- go.mod --
+module mod.com
+-- main.go --
+package main
+
+import "fmt"
+
+type t struct {
+	msg string
+}
+
+func main() {
+	x := []t{t{"msg"}}
+	fmt.Println(x)
+}
+`
+
+	withOptions(
+		WithEditorConfig(fake.EditorConfig{EnableStaticcheck: true}),
+	).run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("main.go")
+		// Staticcheck should generate a diagnostic to simplify this literal.
+		env.Await(env.DiagnosticAtRegexp("main.go", `t{"msg"}`))
+	})
+}
+
+// Test some secondary diagnostics
+func TestSecondaryDiagnostics(t *testing.T) {
+	const dir = `
+-- mod --
+module mod.com
+-- main.go --
+package main
+func main() {
+	panic("not here")
+}
+-- other.go --
+package main
+func main() {}
+`
+	runner.Run(t, dir, func(t *testing.T, env *Env) {
+		log.SetFlags(log.Lshortfile)
+		env.OpenFile("main.go")
+		env.OpenFile("other.go")
+		env.Await(CompletedWork(lsp.DiagnosticWorkTitle(lsp.FromInitialWorkspaceLoad), 1))
+		x := env.DiagnosticsFor("main.go")
+		if len(x.Diagnostics) != 1 {
+			t.Errorf("main.go, got %d diagnostics, expected 1", len(x.Diagnostics))
+		}
+		keep := x.Diagnostics[0]
+		y := env.DiagnosticsFor("other.go")
+		if len(y.Diagnostics) != 1 {
+			t.Errorf("other.go: got %d diagnostics, expected 1", len(y.Diagnostics))
+		}
+		if len(y.Diagnostics[0].RelatedInformation) != 1 {
+			t.Errorf("got %d RelatedInformations, expected 1", len(y.Diagnostics[0].RelatedInformation))
+		}
+		// check that the RelatedInformation matches the error from main.go
+		c := y.Diagnostics[0].RelatedInformation[0]
+		if c.Location.Range != keep.Range {
+			t.Errorf("locations don't match. Got %v expected %v", c.Location.Range, keep.Range)
+		}
 	})
 }
